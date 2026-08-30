@@ -1,0 +1,9 @@
+[package]
+name = "df-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+df-core = { path = "../df-core" }
+serde_json.workspace = true

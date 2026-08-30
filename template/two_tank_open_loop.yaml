@@ -1,0 +1,45 @@
+dsl_version: 2
+metadata:
+  name: 单阀门二阶水箱开环辨识
+  description: 列表波驱动阀门的二阶水箱开环数据生成案例
+clock:
+  mode: GENERATOR
+  cycle_time: 0.5
+program:
+  - name: source_flow
+    type: Variable
+    value: 0.01
+    writable: false
+    display_args: []
+  - name: mv
+    type: LIST_WAVE
+    params:
+      wave_list: [[0.0, 1000.0], [50.0, 1000.0], [100.0, 1000.0]]
+    inputs: {}
+    display_args: []
+  - name: valve_1
+    type: VALVE
+    params: {full_travel_time: 10.0, initial_opening: 0.0}
+    inputs: {target_opening: mv.out, inlet_flow: source_flow}
+    display_args: ["outlet_flow[0.2]", "current_opening[100]", "target_opening[100]"]
+  - name: tank_1
+    type: CYLINDRICAL_TANK
+    params: {height: 2.0, radius: 0.5, outlet_area: 0.001, initial_level: 0.0}
+    inputs: {inlet_flow: valve_1.outlet_flow}
+    display_args: ["level[2]"]
+  - name: tank_2
+    type: CYLINDRICAL_TANK
+    params: {height: 2.0, radius: 0.5, outlet_area: 0.001, initial_level: 0.0}
+    inputs: {inlet_flow: tank_1.outlet_flow}
+    display_args: ["level[2]"]
+  - name: M_DV1
+    type: RANDOM
+    params: {L: 0.0, H: 100.0, max_step: 3.0}
+    inputs: {}
+    display_args: ["out[100]"]
+  - name: M_MV3
+    type: Expression
+    formula: valve_1.current_opening
+    display_args: [M_MV3]
+export:
+  default_columns: [mv.out, valve_1.current_opening, valve_1.outlet_flow, tank_1.level, tank_2.level, M_DV1.out, M_MV3]

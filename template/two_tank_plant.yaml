@@ -1,0 +1,25 @@
+dsl_version: 2
+metadata:
+  name: 二阶水箱仿真模型
+  description: 两个串联圆柱水箱，入口流量可由外部控制算法写入
+clock:
+  mode: GENERATOR
+  cycle_time: 0.5
+program:
+  - name: plant_inlet_flow
+    type: Variable
+    value: 0.0012
+    writable: true
+    display_args: ["plant_inlet_flow[0.003]"]
+  - name: tank_1
+    type: CYLINDRICAL_TANK
+    params: {height: 1.2, radius: 0.15, outlet_area: 0.00025, initial_level: 0.15}
+    inputs: {inlet_flow: plant_inlet_flow}
+    display_args: ["level[1.2]"]
+  - name: tank_2
+    type: CYLINDRICAL_TANK
+    params: {height: 1.2, radius: 0.15, outlet_area: 0.0002, initial_level: 0.10}
+    inputs: {inlet_flow: tank_1.outlet_flow}
+    display_args: ["level[1.2]"]
+export:
+  default_columns: [plant_inlet_flow, tank_1.level, tank_1.outlet_flow, tank_2.level, tank_2.outlet_flow]

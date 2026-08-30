@@ -1,0 +1,43 @@
+dsl_version: 2
+metadata:
+  name: 滞后与表达式案例
+  description: 验证固定周期滞后、随机信号及安全数学表达式
+clock:
+  mode: GENERATOR
+  cycle_time: 0.5
+program:
+  - name: sin1
+    type: SINE_WAVE
+    params: {amplitude: 100.0, period: 1200.0, phase: 0.0, offset: 0.0}
+    inputs: {}
+    display_args: ["out[100]"]
+  - name: lagging_sin1
+    type: Lag
+    source: sin1.out
+    delay: 30
+    display_args: ["lagging_sin1[100]"]
+  - name: non_sense_1
+    type: RANDOM
+    params: {L: 0.0, H: 100.0, max_step: 3.0}
+    inputs: {}
+    display_args: ["out[100]"]
+  - name: non_sense_2
+    type: RANDOM
+    params: {L: 0.0, H: 100.0, max_step: 3.0}
+    inputs: {}
+    display_args: ["out[100]"]
+  - name: delayed_noise_1
+    type: Lag
+    source: non_sense_1.out
+    delay: 30
+    display_args: []
+  - name: non_sense_3
+    type: Expression
+    formula: delayed_noise_1 + 2 * non_sense_2.out
+    display_args: ["non_sense_3[200]"]
+  - name: non_sense_4
+    type: Expression
+    formula: sin(non_sense_3)
+    display_args: ["non_sense_4[2]"]
+export:
+  default_columns: [sin1.out, lagging_sin1, non_sense_1.out, non_sense_2.out, non_sense_3, non_sense_4]

@@ -1,0 +1,11 @@
+/target/
+/build/bin/
+/frontend/node_modules/
+/frontend/dist/
+/.gocache/
+/python/**/__pycache__/
+*.pyc
+/.coverage
+/coverage*.json
+/coverage*.txt
+/coverage-go*

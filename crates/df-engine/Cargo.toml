@@ -1,0 +1,17 @@
+[package]
+name = "df-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+df-core = { path = "../df-core" }
+serde_json.workspace = true
+
+[dev-dependencies]
+df-sdk = { path = "../df-sdk" }
+
+[[bin]]
+name = "df-engine"
+path = "src/main.rs"
+test = false

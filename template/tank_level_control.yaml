@@ -1,0 +1,36 @@
+dsl_version: 2
+metadata:
+  name: 典型水箱液位控制
+  description: 正弦设定值驱动的单水箱PID液位控制
+clock:
+  mode: GENERATOR
+  cycle_time: 0.5
+program:
+  - name: sin1
+    type: SINE_WAVE
+    params: {amplitude: 1.0, period: 2000.0, phase: 0.0, offset: 1.0}
+    inputs: {}
+    display_args: []
+  - name: source_flow
+    type: Variable
+    value: 0.18
+    writable: false
+    display_args: []
+  - name: v_name
+    type: PID
+    execute_first: true
+    params: {PB: 416.67, TI: 30.0, TD: 0.15, KD: 10.0, MODE: 5, SWPN: 1, SVSCL: 0.0, SVSCH: 2.0, SVL: 0.0, SVH: 2.0, MVSCL: 0.0, MVSCH: 100.0, MVL: 0.0, MVH: 100.0, SV: 1.0}
+    inputs: {PV: tank_1.level, SV: sin1.out}
+    display_args: ["MV[100]", "PV[2]", "SV[2]", MODE]
+  - name: valve_1
+    type: VALVE
+    params: {full_travel_time: 10.0, initial_opening: 0.0}
+    inputs: {target_opening: v_name.MV, inlet_flow: source_flow}
+    display_args: []
+  - name: tank_1
+    type: CYLINDRICAL_TANK
+    params: {height: 2.0, radius: 0.5, outlet_area: 0.001, initial_level: 0.0}
+    inputs: {inlet_flow: valve_1.outlet_flow}
+    display_args: []
+export:
+  default_columns: [sin1.out, v_name.MV, v_name.PV, v_name.SV, valve_1.current_opening, tank_1.level]

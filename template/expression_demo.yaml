@@ -1,0 +1,19 @@
+dsl_version: 2
+metadata:
+  name: 表达式测试案例
+  description: 正弦波输出加常数，用于验证表达式计算
+clock:
+  mode: GENERATOR
+  cycle_time: 0.5
+program:
+  - name: v1
+    type: SINE_WAVE
+    params: {amplitude: 100.0, period: 1200.0, phase: 0.0, offset: 0.0}
+    inputs: {}
+    display_args: ["out[100]"]
+  - name: v2
+    type: Expression
+    formula: v1.out + 50
+    display_args: ["v2[150]"]
+export:
+  default_columns: [v1.out, v2]
