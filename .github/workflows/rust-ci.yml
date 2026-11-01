@@ -27,5 +27,7 @@ jobs:
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Build Engine executable for SDK integration tests
+        run: cargo build -p df-engine --bin df-engine
       - name: Run workspace tests
         run: cargo test --workspace --locked
