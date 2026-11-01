@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/df-core", "crates/df-sdk", "crates/df-engine"]
+members = ["crates/df-core", "crates/df-sdk", "crates/df-engine", "crates/df-runtime"]
 resolver = "2"
 
 [workspace.package]
