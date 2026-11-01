@@ -185,6 +185,9 @@ impl Drop for EngineClient {
 #[cfg_attr(coverage, coverage(off))]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
     use std::os::windows::process::ExitStatusExt;
 
     #[test]
