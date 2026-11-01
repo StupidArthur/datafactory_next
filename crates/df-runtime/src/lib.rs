@@ -1,9 +1,10 @@
 use df_core::{Engine, EngineError, Snapshot, Value};
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::fmt;
-
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError};
+use std::path::Path;
+use std::sync::mpsc::{
+    self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError,
+};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -107,7 +108,7 @@ pub enum EngineExecutionError {
     Fatal { code: i32, message: String },
 }
 
-/// Adapter boundary between the realtime scheduler and the model execution process.
+/// Adapter boundary between the realtime scheduler and the model execution engine.
 ///
 /// execute_cycle must advance exactly one model cycle on success. A rejected write
 /// batch must leave the model state and cycle index unchanged.
@@ -161,7 +162,7 @@ enum Command {
 
 /// A handle to one realtime model instance.
 ///
-/// The scheduler owns one Engine process and advances it by one cycle per
+/// The scheduler owns one Engine instance and advances it by one cycle per
 /// wall-clock deadline. Write batches are FIFO and applied atomically at a
 /// cycle boundary. The latest immutable snapshot is available to data adapters.
 pub struct Runtime {
@@ -179,7 +180,7 @@ impl Runtime {
         Self::start(engine)
     }
 
-    pub fn start(engine: Engine) -> Result<Self, RuntimeError> {
+    pub fn start<E: EngineExecutor>(engine: E) -> Result<Self, RuntimeError> {
         Self::start_with_config(engine, RuntimeConfig::default())
     }
 
@@ -309,7 +310,7 @@ impl Runtime {
         }
     }
 
-    /// Stop the scheduler and the owned Engine process. Safe to call repeatedly.
+    /// Stop the scheduler and the owned Engine instance. Safe to call repeatedly.
     pub fn stop(&mut self) -> Result<(), RuntimeError> {
         if let Some(worker) = self.worker.take() {
             request_stop(&self.stop_signal);
@@ -775,5 +776,46 @@ mod tests {
         );
         assert!(matches!(result, Err(RuntimeError::InvalidQueueCapacity)));
         assert!(state.lock().unwrap().stopped);
+    } 
+    #[test]
+    fn bounded_queue_rejects_excess_batches_and_stop_wakes_the_worker() {
+        let (engine, _) = FakeEngine::new(2.0);
+        let mut runtime = Runtime::start_with_config(
+            engine,
+            RuntimeConfig {
+                overrun_policy: OverrunPolicy::Delay,
+                write_queue_capacity: 1,
+            },
+        )
+        .unwrap();
+
+        let ticket = runtime
+            .submit_writes(BTreeMap::from([("input".into(), Value::Float(2.0))]))
+            .unwrap();
+        assert!(matches!(
+            runtime.submit_writes(BTreeMap::from([("input".into(), Value::Float(3.0))])),
+            Err(RuntimeError::QueueFull)
+        ));
+
+        let started = Instant::now();
+        runtime.stop().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(matches!(
+            ticket.wait(Duration::from_millis(20)),
+            Err(RuntimeError::WorkerStopped)
+        ));
     }
+
+    #[test]
+    fn fatal_engine_error_moves_runtime_to_failed() {
+        let (engine, state) = FakeEngine::new(0.01);
+        state.lock().unwrap().fail_next_cycle = true;
+        let mut runtime = Runtime::start(engine).unwrap();
+        sleep(Duration::from_millis(40));
+
+        assert_eq!(runtime.status().state, RuntimeState::Failed);
+        assert!(runtime.stop().is_err());
+        assert!(state.lock().unwrap().stopped);
+    }
+
 }
