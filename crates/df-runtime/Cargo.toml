@@ -5,4 +5,4 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-df-sdk = { path = "../df-sdk" }
+df-core = { path = "../df-core" }
