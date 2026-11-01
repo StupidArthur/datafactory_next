@@ -1,0 +1,8 @@
+[package]
+name = "df-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+df-sdk = { path = "../df-sdk" }
