@@ -217,7 +217,7 @@ dependencies = [
 name = "df-runtime"
 version = "0.1.0"
 dependencies = [
- "df-sdk",
+ "df-core",
 ]
 
 [[package]]
