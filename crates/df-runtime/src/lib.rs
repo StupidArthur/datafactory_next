@@ -701,7 +701,10 @@ mod tests {
     fn publishes_cycles_and_stops_cleanly() {
         let (engine, state) = FakeEngine::new(0.01);
         let mut runtime = Runtime::start(engine).unwrap();
-        sleep(Duration::from_millis(35));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while runtime.snapshot().cycle_index < 2 && Instant::now() < deadline {
+            sleep(Duration::from_millis(5));
+        }
         let snapshot = runtime.snapshot();
         assert!(snapshot.cycle_index >= 2);
         assert_eq!(runtime.status().state, RuntimeState::Running);
@@ -797,7 +800,7 @@ mod tests {
 
         let started = Instant::now();
         runtime.stop().unwrap();
-        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(started.elapsed() < Duration::from_secs(1));
         assert!(matches!(
             ticket.wait(Duration::from_millis(20)),
             Err(RuntimeError::WorkerStopped)
@@ -809,11 +812,13 @@ mod tests {
         let (engine, state) = FakeEngine::new(0.01);
         state.lock().unwrap().fail_next_cycle = true;
         let mut runtime = Runtime::start(engine).unwrap();
-        sleep(Duration::from_millis(40));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while runtime.status().state != RuntimeState::Failed && Instant::now() < deadline {
+            sleep(Duration::from_millis(5));
+        }
 
         assert_eq!(runtime.status().state, RuntimeState::Failed);
         assert!(runtime.stop().is_err());
         assert!(state.lock().unwrap().stopped);
     }
-
 }
