@@ -29,5 +29,9 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Build Engine executable for SDK integration tests
         run: cargo build -p df-engine --bin df-engine
+      - name: Add Engine executable to PATH (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: echo "$GITHUB_WORKSPACE/target/debug" >> "$GITHUB_PATH"
       - name: Run workspace tests
         run: cargo test --workspace --locked
