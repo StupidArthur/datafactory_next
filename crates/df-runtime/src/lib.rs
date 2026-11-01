@@ -1,4 +1,5 @@
-use df_sdk::{EngineClient, EngineError, Snapshot, Value};
+use df_core::{Engine, EngineError, Snapshot, Value};
+use std::path::Path;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -122,40 +123,30 @@ pub trait EngineExecutor: Send + 'static {
     fn stop(&mut self) -> Result<(), String>;
 }
 
-impl EngineExecutor for EngineClient {
+impl EngineExecutor for Engine {
     fn cycle_time(&mut self) -> Result<f64, String> {
-        let metadata = self
-            .get("project_metadata")
-            .map_err(|error| error.to_string())?;
-        metadata
-            .get("cycle_time")
-            .and_then(|value| value.as_f64())
-            .ok_or_else(|| "project metadata has no numeric cycle_time".to_string())
+        Ok(self.metadata().cycle_time)
     }
 
     fn current_snapshot(&mut self) -> Result<Snapshot, String> {
-        self.execute(0, BTreeMap::new())
-            .map_err(|error| error.to_string())
+        Ok(self.snapshot())
     }
 
     fn execute_cycle(
         &mut self,
         writes: &BTreeMap<String, Value>,
     ) -> Result<Snapshot, EngineExecutionError> {
-        self.execute(1, writes.clone()).map_err(map_engine_error)
+        self.execute(1, writes).map_err(map_engine_error)
     }
 
     fn stop(&mut self) -> Result<(), String> {
-        EngineClient::stop(self).map_err(|error| error.to_string())
+        Ok(())
     }
 }
 
 fn map_engine_error(error: EngineError) -> EngineExecutionError {
     let code = error.code();
-    let message = match error {
-        EngineError::Remote { message, .. } => message,
-        other => other.to_string(),
-    };
+    let message = error.to_string();
     if (1201..=1203).contains(&code) {
         EngineExecutionError::WriteRejected { code, message }
     } else {
@@ -190,7 +181,13 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    pub fn start(engine: EngineClient) -> Result<Self, RuntimeError> {
+    pub fn load(project_path: &Path) -> Result<Self, RuntimeError> {
+        let engine = Engine::load(project_path)
+            .map_err(|error| RuntimeError::Engine(error.to_string()))?;
+        Self::start(engine)
+    }
+
+    pub fn start(engine: Engine) -> Result<Self, RuntimeError> {
         Self::start_with_config(engine, RuntimeConfig::default())
     }
 
