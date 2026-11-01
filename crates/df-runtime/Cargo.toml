@@ -6,3 +6,7 @@ license.workspace = true
 
 [dependencies]
 df-core = { path = "../df-core" }
+
+[[bin]]
+name = "df-runtime"
+path = "src/main.rs"
