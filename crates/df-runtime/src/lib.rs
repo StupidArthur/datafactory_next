@@ -175,8 +175,8 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn load(project_path: &Path) -> Result<Self, RuntimeError> {
-        let engine = Engine::load(project_path)
-            .map_err(|error| RuntimeError::Engine(error.to_string()))?;
+        let engine =
+            Engine::load(project_path).map_err(|error| RuntimeError::Engine(error.to_string()))?;
         Self::start(engine)
     }
 
@@ -393,9 +393,7 @@ fn run_worker<E: EngineExecutor>(
         let first_result = engine.execute_cycle(&writes);
         let cycle_result = match first_result {
             Ok(snapshot) => Ok((snapshot, None)),
-            Err(EngineExecutionError::WriteRejected { code, message })
-                if !writes.is_empty() =>
-            {
+            Err(EngineExecutionError::WriteRejected { code, message }) if !writes.is_empty() => {
                 // A bad external write must not consume the scheduled model tick.
                 // Reject the batch atomically, then execute this tick without writes.
                 match engine.execute_cycle(&BTreeMap::new()) {
@@ -450,9 +448,7 @@ fn run_worker<E: EngineExecutor>(
                     }
                 };
                 if let Some(item) = active {
-                    let _ = item
-                        .reply
-                        .send(Err(RuntimeError::Engine(message.clone())));
+                    let _ = item.reply.send(Err(RuntimeError::Engine(message.clone())));
                 }
                 update_status(&status, |current| {
                     current.state = RuntimeState::Failed;
@@ -559,11 +555,7 @@ fn publish_snapshot(
     });
 }
 
-fn record_execution_duration(
-    status: &Mutex<RuntimeStatus>,
-    elapsed: Duration,
-    period: Duration,
-) {
+fn record_execution_duration(status: &Mutex<RuntimeStatus>, elapsed: Duration, period: Duration) {
     update_status(status, |current| {
         current.last_execution_duration = elapsed;
         current.max_execution_duration = current.max_execution_duration.max(elapsed);
@@ -638,7 +630,12 @@ mod tests {
                 stopped: false,
                 fail_next_cycle: false,
             }));
-            (Self { state: Arc::clone(&state) }, state)
+            (
+                Self {
+                    state: Arc::clone(&state),
+                },
+                state,
+            )
         }
 
         fn snapshot(state: &FakeState) -> Snapshot {
@@ -776,7 +773,8 @@ mod tests {
         );
         assert!(matches!(result, Err(RuntimeError::InvalidQueueCapacity)));
         assert!(state.lock().unwrap().stopped);
-    } 
+    }
+
     #[test]
     fn bounded_queue_rejects_excess_batches_and_stop_wakes_the_worker() {
         let (engine, _) = FakeEngine::new(2.0);
