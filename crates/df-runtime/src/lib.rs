@@ -1,12 +1,10 @@
 use df_core::{Engine, EngineError, Snapshot, Value};
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{
-    self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError,
-};
-use std::sync::{Arc, Mutex, RwLock};
+
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -159,12 +157,6 @@ enum Command {
         values: BTreeMap<String, Value>,
         reply: Sender<Result<WriteReceipt, RuntimeError>>,
     },
-    Wake,
-}
-
-struct PendingWrite {
-    values: BTreeMap<String, Value>,
-    reply: Sender<Result<WriteReceipt, RuntimeError>>,
 }
 
 /// A handle to one realtime model instance.
@@ -176,7 +168,7 @@ pub struct Runtime {
     sender: SyncSender<Command>,
     status: Arc<Mutex<RuntimeStatus>>,
     snapshot: Arc<RwLock<Snapshot>>,
-    stop_requested: Arc<AtomicBool>,
+    stop_signal: Arc<(Mutex<bool>, Condvar)>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -246,12 +238,12 @@ impl Runtime {
             last_error: None,
         }));
         let snapshot = Arc::new(RwLock::new(initial_snapshot));
-        let stop_requested = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new((Mutex::new(false), Condvar::new()));
         let (sender, receiver) = mpsc::sync_channel(config.write_queue_capacity);
 
         let worker_status = Arc::clone(&status);
         let worker_snapshot = Arc::clone(&snapshot);
-        let worker_stop_requested = Arc::clone(&stop_requested);
+        let worker_stop_signal = Arc::clone(&stop_signal);
         let worker = thread::Builder::new()
             .name("df-runtime-clock".into())
             .spawn(move || {
@@ -262,7 +254,7 @@ impl Runtime {
                     receiver,
                     worker_status,
                     worker_snapshot,
-                    worker_stop_requested,
+                    worker_stop_signal,
                 )
             })
             .map_err(|error| RuntimeError::Engine(format!("cannot start worker: {error}")))?;
@@ -271,7 +263,7 @@ impl Runtime {
             sender,
             status,
             snapshot,
-            stop_requested,
+            stop_signal,
             worker: Some(worker),
         })
     }
@@ -302,7 +294,7 @@ impl Runtime {
         if writes.is_empty() {
             return Err(RuntimeError::EmptyWriteBatch);
         }
-        if self.stop_requested.load(Ordering::Acquire) {
+        if stop_requested(&self.stop_signal) {
             return Err(RuntimeError::WorkerStopped);
         }
 
@@ -320,10 +312,7 @@ impl Runtime {
     /// Stop the scheduler and the owned Engine process. Safe to call repeatedly.
     pub fn stop(&mut self) -> Result<(), RuntimeError> {
         if let Some(worker) = self.worker.take() {
-            self.stop_requested.store(true, Ordering::Release);
-            // A blocking send wakes a worker waiting for its next deadline.
-            // It can wait only until the worker consumes one queued command.
-            let _ = self.sender.send(Command::Wake);
+            request_stop(&self.stop_signal);
             if worker.join().is_err() {
                 let mut status = self
                     .status
@@ -376,136 +365,112 @@ fn run_worker<E: EngineExecutor>(
     receiver: Receiver<Command>,
     status: Arc<Mutex<RuntimeStatus>>,
     snapshot: Arc<RwLock<Snapshot>>,
-    stop_requested: Arc<AtomicBool>,
+    stop_signal: Arc<(Mutex<bool>, Condvar)>,
 ) {
     update_status(&status, |current| current.state = RuntimeState::Running);
     let mut next_deadline = Instant::now()
         .checked_add(period)
         .unwrap_or_else(Instant::now);
-    let mut pending = VecDeque::<PendingWrite>::new();
 
     loop {
-        if stop_requested.load(Ordering::Acquire) {
+        if wait_until_deadline(next_deadline, &stop_signal) {
             break;
         }
 
-        let timeout = next_deadline.saturating_duration_since(Instant::now());
-        match receiver.recv_timeout(timeout) {
-            Ok(command) => {
-                enqueue(command, &mut pending);
-                if stop_requested.load(Ordering::Acquire) {
-                    break;
+        // Take at most one batch per cycle. The bounded channel remains the
+        // only pending-write buffer, so queued work cannot grow without limit.
+        let active = match receiver.try_recv() {
+            Ok(Command::Write { values, reply }) => Some(PendingWrite { values, reply }),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
+        };
+        let writes = active
+            .as_ref()
+            .map(|item| item.values.clone())
+            .unwrap_or_default();
+        let started = Instant::now();
+
+        let first_result = engine.execute_cycle(&writes);
+        let cycle_result = match first_result {
+            Ok(snapshot) => Ok((snapshot, None)),
+            Err(EngineExecutionError::WriteRejected { code, message })
+                if !writes.is_empty() =>
+            {
+                // A bad external write must not consume the scheduled model tick.
+                // Reject the batch atomically, then execute this tick without writes.
+                match engine.execute_cycle(&BTreeMap::new()) {
+                    Ok(snapshot) => Ok((
+                        snapshot,
+                        Some(RuntimeError::WriteRejected { code, message }),
+                    )),
+                    Err(error) => Err(error),
                 }
             }
-            Err(RecvTimeoutError::Disconnected) => break,
-            Err(RecvTimeoutError::Timeout) => {
-                loop {
-                    match receiver.try_recv() {
-                        Ok(command) => enqueue(command, &mut pending),
-                        Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-                    }
-                }
+            Err(error) => Err(error),
+        };
 
-                if stop_requested.load(Ordering::Acquire) {
-                    break;
-                }
+        let elapsed = started.elapsed();
+        record_execution_duration(&status, elapsed, period);
 
-                let active = pending.pop_front();
-                let writes = active
-                    .as_ref()
-                    .map(|item| item.values.clone())
-                    .unwrap_or_default();
-                let started = Instant::now();
-
-                let first_result = engine.execute_cycle(&writes);
-                let cycle_result = match first_result {
-                    Ok(snapshot) => Ok((snapshot, None)),
-                    Err(EngineExecutionError::WriteRejected { code, message })
-                        if !writes.is_empty() =>
-                    {
-                        // A bad external write must not consume the scheduled model tick.
-                        // Reject the batch atomically, then execute this tick without writes.
-                        match engine.execute_cycle(&BTreeMap::new()) {
-                            Ok(snapshot) => Ok((
-                                snapshot,
-                                Some(RuntimeError::WriteRejected { code, message }),
-                            )),
-                            Err(error) => Err(error),
-                        }
-                    }
-                    Err(error) => Err(error),
-                };
-
-                let elapsed = started.elapsed();
-                record_execution_duration(&status, elapsed, period);
-
-                match cycle_result {
-                    Ok((new_snapshot, write_error)) => {
-                        publish_snapshot(&snapshot, &status, &new_snapshot);
-                        if let Some(item) = active {
-                            let result = match write_error {
-                                Some(error) => {
-                                    update_status(&status, |current| {
-                                        current.rejected_write_batches =
-                                            current.rejected_write_batches.saturating_add(1);
-                                        if let RuntimeError::WriteRejected { message, .. } = &error {
-                                            current.last_write_error = Some(message.clone());
-                                        }
-                                    });
-                                    Err(error)
-                                }
-                                None => {
-                                    update_status(&status, |current| {
-                                        current.last_write_error = None;
-                                    });
-                                    Ok(WriteReceipt {
-                                        effective_cycle_index: new_snapshot.cycle_index,
-                                        simulation_time: new_snapshot.simulation_time,
-                                    })
-                                }
-                            };
-                            let _ = item.reply.send(result);
-                        }
-                    }
-                    Err(error) => {
-                        let message = match error {
-                            EngineExecutionError::WriteRejected { code, message } => {
-                                format!("unexpected write rejection during an empty cycle (code {code}): {message}")
-                            }
-                            EngineExecutionError::Fatal { code, message } => {
-                                format!("engine error {code}: {message}")
-                            }
-                        };
-                        if let Some(item) = active {
-                            let _ = item
-                                .reply
-                                .send(Err(RuntimeError::Engine(message.clone())));
-                        }
-                        update_status(&status, |current| {
-                            current.state = RuntimeState::Failed;
-                            current.last_error = Some(message.clone());
-                        });
-                        reject_pending(
-                            &mut pending,
-                            &receiver,
-                            RuntimeError::Engine(message.clone()),
-                        );
-                        if let Err(stop_error) = engine.stop() {
+        match cycle_result {
+            Ok((new_snapshot, write_error)) => {
+                publish_snapshot(&snapshot, &status, &new_snapshot);
+                if let Some(item) = active {
+                    let result = match write_error {
+                        Some(error) => {
                             update_status(&status, |current| {
-                                current.last_error = Some(format!(
-                                    "{}; engine shutdown also failed: {}",
-                                    message, stop_error
-                                ));
+                                current.rejected_write_batches =
+                                    current.rejected_write_batches.saturating_add(1);
+                                if let RuntimeError::WriteRejected { message, .. } = &error {
+                                    current.last_write_error = Some(message.clone());
+                                }
                             });
+                            Err(error)
                         }
-                        return;
-                    }
+                        None => {
+                            update_status(&status, |current| {
+                                current.last_write_error = None;
+                            });
+                            Ok(WriteReceipt {
+                                effective_cycle_index: new_snapshot.cycle_index,
+                                simulation_time: new_snapshot.simulation_time,
+                            })
+                        }
+                    };
+                    let _ = item.reply.send(result);
                 }
-
-                next_deadline =
-                    advance_deadline(next_deadline, period, config.overrun_policy, &status);
+            }
+            Err(error) => {
+                let message = match error {
+                    EngineExecutionError::WriteRejected { code, message } => {
+                        format!("unexpected write rejection during an empty cycle (code {code}): {message}")
+                    }
+                    EngineExecutionError::Fatal { code, message } => {
+                        format!("engine error {code}: {message}")
+                    }
+                };
+                if let Some(item) = active {
+                    let _ = item
+                        .reply
+                        .send(Err(RuntimeError::Engine(message.clone())));
+                }
+                update_status(&status, |current| {
+                    current.state = RuntimeState::Failed;
+                    current.last_error = Some(message.clone());
+                });
+                reject_pending(&receiver, RuntimeError::Engine(message.clone()));
+                if let Err(stop_error) = engine.stop() {
+                    update_status(&status, |current| {
+                        current.last_error = Some(format!(
+                            "{}; engine shutdown also failed: {}",
+                            message, stop_error
+                        ));
+                    });
+                }
+                return;
             }
         }
+
+        next_deadline = advance_deadline(next_deadline, period, config.overrun_policy, &status);
     }
 
     update_status(&status, |current| {
@@ -513,7 +478,7 @@ fn run_worker<E: EngineExecutor>(
             current.state = RuntimeState::Stopping;
         }
     });
-    reject_pending(&mut pending, &receiver, RuntimeError::WorkerStopped);
+    reject_pending(&receiver, RuntimeError::WorkerStopped);
 
     match engine.stop() {
         Ok(()) => update_status(&status, |current| {
@@ -528,26 +493,52 @@ fn run_worker<E: EngineExecutor>(
     }
 }
 
-fn enqueue(command: Command, pending: &mut VecDeque<PendingWrite>) {
-    if let Command::Write { values, reply } = command {
-        pending.push_back(PendingWrite { values, reply });
-    }
+struct PendingWrite {
+    values: BTreeMap<String, Value>,
+    reply: Sender<Result<WriteReceipt, RuntimeError>>,
 }
 
-fn reject_pending(
-    pending: &mut VecDeque<PendingWrite>,
-    receiver: &Receiver<Command>,
-    error: RuntimeError,
-) {
-    while let Some(item) = pending.pop_front() {
-        let _ = item.reply.send(Err(error.clone()));
+fn stop_requested(signal: &(Mutex<bool>, Condvar)) -> bool {
+    *signal
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn request_stop(signal: &(Mutex<bool>, Condvar)) {
+    let mut requested = signal
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *requested = true;
+    signal.1.notify_all();
+}
+
+fn wait_until_deadline(deadline: Instant, signal: &(Mutex<bool>, Condvar)) -> bool {
+    let mut requested = signal
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while !*requested {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let (guard, _) = signal
+            .1
+            .wait_timeout(requested, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        requested = guard;
     }
+    true
+}
+
+fn reject_pending(receiver: &Receiver<Command>, error: RuntimeError) {
     loop {
         match receiver.try_recv() {
             Ok(Command::Write { reply, .. }) => {
                 let _ = reply.send(Err(error.clone()));
             }
-            Ok(Command::Wake) => {}
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
         }
     }
