@@ -302,3 +302,13 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
 - [ ] 在 Windows 环境验证 Runtime 启动、写入、停止和持续运行。
 
 **当前边界：** 目前实现的是单个 Engine 实例的实时调度核心，不包含独立 CLI、多组态实例管理和 OPC UA。后续 OPC UA 必须通过 Runtime 写入队列进入 Engine，不能直接改写模型状态。
+
+
+### 2026-11-02：Runtime CLI 首轮实现
+
+- [~] 增加 df-runtime run <project.dfproject> 命令入口，独立于 Studio 启动实时调度。
+- [~] 增加 stdin status/snapshot/stop 控制命令，关闭输入流时执行清理。
+- [ ] 增加 Windows 服务/信号优雅停止机制。
+- [ ] 增加 YAML 直接启动流程（内部调用现有 Compiler 生成临时或发布的 dfproject）。
+- [ ] 实际执行 cargo fmt --check、cargo check --workspace 和 cargo test --workspace。
+- [ ] 在 Windows 目标环境进行真实项目持续运行和写入闭环验收。
