@@ -4,7 +4,7 @@
 
 ## 1. 模块职责
 
-新增 df-runtime crate，位于现有 Rust Engine 之上。它不实现第二套模型计算逻辑，而是通过 df-sdk::EngineClient 驱动已有 df-engine 进程。
+新增 df-runtime crate，位于现有 Rust Engine 之上。它不实现第二套模型计算逻辑，而是直接在进程内调用 df-core::Engine，不经过 df-sdk 子进程协议。
 
 ```text
 Runtime API / 后续 OPC UA Adapter
@@ -12,17 +12,13 @@ Runtime API / 后续 OPC UA Adapter
        bounded write queue
               │
        df-runtime scheduler
-              │ execute(1, writes)
+              │ Engine::execute(1, writes)
               ▼
-          df-sdk
-              │
-          df-engine
-              │
-           df-core
+            df-core
 ```
 
 - df-core 继续只处理仿真周期和模型状态。
-- df-engine 继续提供单进程请求/响应执行接口。
+- df-engine 与 df-sdk 保持原有用途，供进程隔离或其他语言调用；实时 Runtime 不经由该 IPC 路径。
 - df-runtime 负责真实时间调度、外部写入排队、运行状态和最新 Snapshot。
 - OPC UA 尚未集成；后续 OPC UA Adapter 应调用同一个 Runtime::submit_writes，读取 Runtime::snapshot，不得直接修改 Engine 状态。
 
@@ -30,7 +26,7 @@ Runtime API / 后续 OPC UA Adapter
 
 1. Runtime 从编译后 Project 的 project_metadata.cycle_time 读取周期。
 2. 启动时先读取一次初始 Snapshot。
-3. 每到一个墙上时钟周期，Runtime 调用一次 EngineClient::execute(1, writes)。
+3. 每到一个墙上时钟周期，Runtime 调用一次 Engine::execute(1, writes)。
 4. Engine 仍只按 cycle_time 推进仿真时间，不读取系统时钟。
 5. 正常情况下，模型周期与真实时间节拍一致；发生超时时，按照 OverrunPolicy 处理。
 6. Runtime 不跳过模型周期。cycle_index 只由 Engine 成功执行周期后推进。
@@ -63,7 +59,7 @@ Runtime API / 后续 OPC UA Adapter
 ## 5. 当前公开接口
 
 ```rust
-let engine = EngineClient::start(project_path)?;
+let engine = Engine::load(project_path)?;
 let mut runtime = Runtime::start(engine)?;
 
 let ticket = runtime.submit_writes(BTreeMap::from([
