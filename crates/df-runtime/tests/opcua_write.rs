@@ -1,9 +1,9 @@
 #![cfg(feature = "opcua")]
 
-//! R8 closed-loop write integration tests (design §8, §14.5 WR-01..WR-09,
-//! §9.1 SEC-04).
+//! OPC UA integration tests for write semantics and closed-loop control
+//! (design §8, §9.1 SEC-04, §14.5 WR-01..WR-09 and CL-01/CL-02).
 //!
-//! Four scenarios over real engines, a real `SignAndEncrypt` server with
+//! Seven scenarios over real engines, a real `SignAndEncrypt` server with
 //! configured users (username/password over None is refused by §9.1) and
 //! independent clients:
 //!
@@ -19,9 +19,10 @@
 //!    batches without applying them (WR-09),
 //! 5. one request spanning two instances: instance A's invalid tag withholds
 //!    only A's batch while instance B's valid batch commits (§8.3),
-//! 6. the R9 dual-tank closed loop: two instances, two independent client
-//!    sessions, a setpoint write on A that the model responds to, and B
-//!    isolated from it (CL-01/CL-02).
+//! 6. the R9 two-instance process-input example: two independent sessions,
+//!    an inlet-flow write on A, and B isolated from it,
+//! 7. the PID setpoint example: an external level setpoint drives PID output,
+//!    valve position and both tank levels through a real Engine.
 //!
 //! Certificate and PKI handling follows the proven R5/R7 pattern: every
 //! fixture generates a fresh sample keypair for the server, and every client
@@ -56,6 +57,10 @@ const INITIAL_INLET: f64 = 0.0012;
 
 fn two_tank_project() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/two-tank/two-tank.dfproject")
+}
+
+fn pid_closed_loop_project() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/two-tank/pid-closed-loop.yaml")
 }
 
 /// A copy of the shipped two-tank YAML with a different cycle time, written
@@ -131,12 +136,16 @@ struct WriteFixture {
 
 impl Drop for WriteFixture {
     fn drop(&mut self) {
-        self.runtime.stop();
+        let _ = self.runtime.stop();
         self.server.stop();
     }
 }
 
 impl WriteFixture {
+    fn tag(&self, tag_name: &str) -> NodeId {
+        self.index.tag(INSTANCE, tag_name).unwrap().node_id.clone()
+    }
+
     fn inlet(&self) -> NodeId {
         self.index.tag(INSTANCE, INLET).unwrap().node_id.clone()
     }
@@ -187,7 +196,7 @@ fn start_fixture(
         instance_id: INSTANCE.into(),
         tags: engine.catalog().to_vec(),
     }];
-    let mut server = OpcUaServer::start_with_catalogs(&config, &catalogs).unwrap();
+    let server = OpcUaServer::start_with_catalogs(&config, &catalogs).unwrap();
     let runtime = Runtime::start_with_config(
         engine,
         RuntimeConfig {
@@ -435,6 +444,34 @@ async fn wait_for_value(session: &opcua::client::Session, node_id: &NodeId, expe
         assert!(
             Instant::now() < deadline,
             "tag must reach {expected} through the engine round trip, got {:?}",
+            values[0]
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_double_condition<F>(
+    session: &opcua::client::Session,
+    node_id: &NodeId,
+    timeout: Duration,
+    description: &str,
+    predicate: F,
+) -> f64
+where
+    F: Fn(f64) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        let values = read_values(session, &[node_id.clone()]).await;
+        if values[0].status == Some(opcua::types::StatusCode::Good) {
+            let value = as_double(&values[0]);
+            if predicate(value) {
+                return value;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {description}; last value: {:?}",
             values[0]
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -704,7 +741,7 @@ async fn stopped_instances_reject_writes_and_pending_batches_are_discarded() {
     );
     assert_eq!(fixture.runtime.handle().queue_depth(), 1);
 
-    fixture.runtime.stop();
+    fixture.runtime.stop().unwrap();
 
     // The queued batch was never applied: the snapshot still carries the
     // initial 0.0012.
@@ -950,4 +987,266 @@ async fn multi_instance_request_vetoes_one_batch_without_blocking_the_other() {
     );
 
     engineer.disconnect().await.unwrap();
+}
+
+/// External setpoint → PID → valve → two tanks → PID feedback (§14.5 CL-01/CL-02).
+///
+/// The project starts near a steady operating point. The client first raises
+/// the setpoint and then lowers it, proving that the controller and actuator
+/// respond in both directions while the process variables retain their
+/// physical lag.
+#[tokio::test]
+async fn opcua_pid_setpoint_controls_valve_and_two_tank_levels() {
+    let fixture = start_fixture("pid_closed_loop", &pid_closed_loop_project(), 32, None);
+    let session = connect_user(
+        "pid_closed_loop_client",
+        "engineer",
+        "engineer-pw",
+        &fixture.endpoint_url,
+    )
+    .await;
+
+    let setpoint = fixture.tag("level_setpoint");
+    let pid_sv = fixture.tag("pid2.SV");
+    let pid_pv = fixture.tag("pid2.PV");
+    let pid_mv = fixture.tag("pid2.MV");
+    let valve_target = fixture.tag("valve_1.target_opening");
+    let valve_opening = fixture.tag("valve_1.current_opening");
+    let valve_flow = fixture.tag("valve_1.outlet_flow");
+    let tank_1_level = fixture.tag("tank_1.level");
+    let tank_2_level = fixture.tag("tank_2.level");
+
+    assert!(
+        fixture
+            .index
+            .tag(INSTANCE, "level_setpoint")
+            .unwrap()
+            .writable,
+        "the external setpoint must be writable"
+    );
+    for read_only_tag in [
+        "pid2.SV",
+        "pid2.PV",
+        "pid2.MV",
+        "valve_1.target_opening",
+        "valve_1.current_opening",
+        "valve_1.outlet_flow",
+        "tank_1.level",
+        "tank_2.level",
+    ] {
+        assert!(
+            !fixture.index.tag(INSTANCE, read_only_tag).unwrap().writable,
+            "{read_only_tag} must remain a read-only process/status tag"
+        );
+    }
+
+    // Wait for the first Engine cycle to publish the configured operating point.
+    wait_for_value(&session, &valve_target, 23.0).await;
+    wait_for_value(&session, &valve_opening, 23.0).await;
+    let nodes = [
+        setpoint.clone(),
+        pid_sv.clone(),
+        pid_pv.clone(),
+        pid_mv.clone(),
+        valve_target.clone(),
+        valve_opening.clone(),
+        valve_flow.clone(),
+        tank_1_level.clone(),
+        tank_2_level.clone(),
+    ];
+    let initial = read_values(&session, &nodes).await;
+    for (name, value) in [
+        "level_setpoint",
+        "pid2.SV",
+        "pid2.PV",
+        "pid2.MV",
+        "valve_1.target_opening",
+        "valve_1.current_opening",
+        "valve_1.outlet_flow",
+        "tank_1.level",
+        "tank_2.level",
+    ]
+    .iter()
+    .zip(initial.iter())
+    {
+        assert_eq!(
+            value.status,
+            Some(opcua::types::StatusCode::Good),
+            "{name} must be readable at the initial operating point"
+        );
+    }
+    let initial_setpoint = as_double(&initial[0]);
+    let initial_pv = as_double(&initial[2]);
+    let initial_mv = as_double(&initial[3]);
+    let initial_target = as_double(&initial[4]);
+    let initial_opening = as_double(&initial[5]);
+    let initial_flow = as_double(&initial[6]);
+    let initial_tank_1 = as_double(&initial[7]);
+    let initial_tank_2 = as_double(&initial[8]);
+
+    assert!(
+        (initial_setpoint - 0.0970642201834862).abs() < 1e-6,
+        "unexpected initial setpoint: {initial_setpoint}"
+    );
+    assert!(
+        (initial_pv - initial_tank_2).abs() < 1e-3,
+        "PID PV must reflect the measured second-tank level"
+    );
+
+    // Confirm the actual OPC UA write boundary for the process/status tags,
+    // not only the compiler catalog metadata.
+    for (name, node) in [
+        ("pid2.SV", &pid_sv),
+        ("pid2.PV", &pid_pv),
+        ("pid2.MV", &pid_mv),
+        ("valve_1.target_opening", &valve_target),
+        ("valve_1.current_opening", &valve_opening),
+        ("valve_1.outlet_flow", &valve_flow),
+        ("tank_1.level", &tank_1_level),
+        ("tank_2.level", &tank_2_level),
+    ] {
+        let status = write_one(&session, node, double_value(0.0)).await;
+        assert_eq!(
+            status,
+            opcua::types::StatusCode::BadNotWritable,
+            "{name} must reject direct OPC UA writes"
+        );
+    }
+
+    // Step the external setpoint up. Good is returned only after the Runtime
+    // confirms the write at an Engine cycle boundary.
+    let write_status = write_one(&session, &setpoint, double_value(0.40)).await;
+    assert!(
+        write_status.is_good(),
+        "raising the external setpoint must succeed: {write_status:?}"
+    );
+    wait_for_value(&session, &setpoint, 0.40).await;
+    wait_for_value(&session, &pid_sv, 0.40).await;
+
+    let raised_mv = wait_for_double_condition(
+        &session,
+        &pid_mv,
+        Duration::from_secs(5),
+        "PID output to increase after the setpoint step",
+        |value| value > initial_mv + 10.0,
+    )
+    .await;
+    let raised_target = wait_for_double_condition(
+        &session,
+        &valve_target,
+        Duration::from_secs(5),
+        "valve target opening to follow PID output",
+        |value| value > initial_target + 10.0,
+    )
+    .await;
+    let raised_opening = wait_for_double_condition(
+        &session,
+        &valve_opening,
+        Duration::from_secs(10),
+        "physical valve opening to follow its target",
+        |value| value > initial_opening + 10.0,
+    )
+    .await;
+    let raised_flow = wait_for_double_condition(
+        &session,
+        &valve_flow,
+        Duration::from_secs(5),
+        "valve outlet flow to follow the increased actual opening",
+        |value| value > initial_flow + 0.0001,
+    )
+    .await;
+    let raised_tank_1 = wait_for_double_condition(
+        &session,
+        &tank_1_level,
+        Duration::from_secs(30),
+        "first-tank level to respond to increased inlet flow",
+        |value| value > initial_tank_1 + 0.02,
+    )
+    .await;
+    let raised_tank_2 = wait_for_double_condition(
+        &session,
+        &tank_2_level,
+        Duration::from_secs(40),
+        "second-tank level to respond through the cascade",
+        |value| value > initial_tank_2 + 0.01,
+    )
+    .await;
+
+    let raised_pv = wait_for_double_condition(
+        &session,
+        &pid_pv,
+        Duration::from_secs(5),
+        "PID process value to follow the rising second-tank level",
+        |value| value > initial_pv + 0.01,
+    )
+    .await;
+    let high_values = read_values(
+        &session,
+        &[
+            pid_sv.clone(),
+            pid_pv.clone(),
+            pid_mv.clone(),
+            valve_target.clone(),
+            valve_opening.clone(),
+            valve_flow.clone(),
+        ],
+    )
+    .await;
+    assert!((as_double(&high_values[0]) - 0.40).abs() < 1e-9);
+    assert!(as_double(&high_values[1]) > initial_pv + 0.01);
+    let high_mv = as_double(&high_values[2]);
+    let high_target = as_double(&high_values[3]);
+    let high_opening = as_double(&high_values[4]);
+    let high_flow = as_double(&high_values[5]);
+    assert!((high_mv - high_target).abs() < 1e-9);
+
+    // Step the setpoint down. PID output and valve target respond first;
+    // actual tank levels follow later because the valve and process have lag.
+    let write_status = write_one(&session, &setpoint, double_value(0.20)).await;
+    assert!(
+        write_status.is_good(),
+        "lowering the external setpoint must succeed: {write_status:?}"
+    );
+    wait_for_value(&session, &setpoint, 0.20).await;
+    wait_for_value(&session, &pid_sv, 0.20).await;
+
+    let lowered_mv = wait_for_double_condition(
+        &session,
+        &pid_mv,
+        Duration::from_secs(5),
+        "PID output to decrease after the setpoint is lowered",
+        |value| value < high_mv - 5.0,
+    )
+    .await;
+    let lowered_target = wait_for_double_condition(
+        &session,
+        &valve_target,
+        Duration::from_secs(5),
+        "valve target opening to decrease with PID output",
+        |value| value < high_target - 5.0,
+    )
+    .await;
+    let lowered_opening = wait_for_double_condition(
+        &session,
+        &valve_opening,
+        Duration::from_secs(10),
+        "physical valve opening to move toward the lower target",
+        |value| value < high_opening - 5.0,
+    )
+    .await;
+
+    let lowered_flow = wait_for_double_condition(
+        &session,
+        &valve_flow,
+        Duration::from_secs(10),
+        "valve outlet flow to decrease after the setpoint is lowered",
+        |value| value < high_flow - 0.00005,
+    )
+    .await;
+
+    println!(
+        "PID_CLOSED_LOOP_EVIDENCE initial={{setpoint:{initial_setpoint:.6},pv:{initial_pv:.6},mv:{initial_mv:.3},valve:{initial_opening:.3},flow:{initial_flow:.6},tank1:{initial_tank_1:.6},tank2:{initial_tank_2:.6}}} step_up_response={{setpoint:0.400000,pv:{raised_pv:.6},mv:{raised_mv:.3},target:{raised_target:.3},opening:{raised_opening:.3},flow:{raised_flow:.6},tank1:{raised_tank_1:.6},tank2:{raised_tank_2:.6}}} step_up_followup={{mv:{high_mv:.3},target:{high_target:.3},opening:{high_opening:.3},flow:{high_flow:.6}}} step_down={{setpoint:0.200000,mv:{lowered_mv:.3},target:{lowered_target:.3},opening:{lowered_opening:.3},flow:{lowered_flow:.6}}}"
+    );
+
+    session.disconnect().await.unwrap();
 }

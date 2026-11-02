@@ -1,0 +1,84 @@
+dsl_version: 2
+metadata:
+  name: two_tank_pid_closed_loop
+  description: 外部 OPC UA 设定值驱动 PID、调节阀和串联双水箱的实时闭环案例
+clock:
+  mode: GENERATOR
+  cycle_time: 0.5
+program:
+  - name: source_flow
+    type: Variable
+    value: 0.0012
+    writable: false
+    display_args: []
+  # This is the only externally writable process input. PID state and plant
+  # outputs remain read-only in the Tag Catalog.
+  - name: level_setpoint
+    type: Variable
+    value: 0.0970642201834862
+    writable: true
+    display_args: ["level_setpoint[1.2]"]
+  - name: pid2
+    type: PID
+    params:
+      PB: 1.5
+      TI: 30.0
+      TD: 0.0
+      KD: 10.0
+      MODE: 5
+      SWPN: 1
+      SVSCL: 0.0
+      SVSCH: 1.2
+      SVL: 0.0
+      SVH: 1.2
+      MVSCL: 0.0
+      MVSCH: 100.0
+      MVL: 0.0
+      MVH: 100.0
+      PV: 0.0970642201834862
+      SV: 0.0970642201834862
+      MV: 23.0
+    inputs:
+      PV: tank_2.level
+      SV: level_setpoint
+    display_args: ["MV[100]", "PV[1.2]", "SV[1.2]", MODE]
+  - name: valve_1
+    type: VALVE
+    params: {full_travel_time: 12.0, initial_opening: 23.0}
+    inputs:
+      target_opening: pid2.MV
+      inlet_flow: source_flow
+    display_args: ["current_opening[100]", "target_opening[100]"]
+  - name: tank_1
+    type: CYLINDRICAL_TANK
+    params:
+      height: 1.2
+      radius: 0.15
+      outlet_area: 0.00025
+      initial_level: 0.0621211009174312
+    inputs:
+      inlet_flow: valve_1.outlet_flow
+    display_args: ["level[1.2]"]
+  - name: tank_2
+    type: CYLINDRICAL_TANK
+    params:
+      height: 1.2
+      radius: 0.15
+      outlet_area: 0.0002
+      initial_level: 0.0970642201834862
+    inputs:
+      inlet_flow: tank_1.outlet_flow
+    display_args: ["level[1.2]"]
+export:
+  default_columns:
+    - level_setpoint
+    - pid2.SV
+    - pid2.PV
+    - pid2.MV
+    - valve_1.target_opening
+    - valve_1.current_opening
+    - valve_1.outlet_flow
+    - tank_1.level
+    - tank_1.outlet_flow
+    - tank_2.level
+    - tank_2.outlet_flow

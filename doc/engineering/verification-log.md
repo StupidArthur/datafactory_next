@@ -609,7 +609,7 @@ GitHub Actions [Rust CI #41417657194](https://github.com/StupidArthur/datafactor
 
 1. 启动与读取：两个 session 分别读取各自实例的 `plant_inlet_flow` 与 `tank_1.level`；两边初始输入均为 0.0012、初始液位一致。
 2. 写入实例 A：`plant_inlet_flow` ← 0.004，返回 Good（Engine 周期边界确认后），随后经发布链回读 0.004（WR-07 证据链）。
-3. 模型响应：`tank_1.level` 上升到高于初值（CL-01：设定值进入 Engine，输出由模型计算得出）。
+3. 模型响应：`tank_1.level` 上升到高于初值（CL-01：外部过程输入进入 Engine，输出由模型计算得出；完整 PID 设定值链见“外部 PID 设定值双水箱闭环补充实施例”）。
 4. 非回放：再次写 0.006 并回读 0.006，证明输出跟随当前输入变化（CL-02）。
 5. 实例 B 隔离：
    - 客户端读 B 的 `plant_inlet_flow` 仍为 0.0012；
@@ -634,7 +634,108 @@ cargo test -p df-runtime --features opcua --test opcua_write  → 6 passed / 0 f
 - 本项是**本地聚焦验证**：CI 只跑默认 feature，未启用 `opcua`，因此该测试不在 CI 覆盖范围内。
 - 未启动 Studio，未构建外部进程编排系统，未跑完整 `--features opcua` 测试电池。
 
+## 2026-11-02：外部 PID 设定值双水箱闭环补充实施例
 
+本轮在 R9 双实例过程输入闭环之外，增加一个独立的 PID 控制实施例，验证外部 OPC UA 设定值经过 PID 和阀门后，驱动串联双水箱过程变量变化。实现范围限于示范工程、真实客户端集成测试和聚焦 CI，不扩展 Runtime / OPC UA 运行时接口。
 
+### 1. 工程与权限边界
 
+新增 `examples/two-tank/pid-closed-loop.yaml`，并配套 `examples/two-tank/README.md`。
+
+控制链：
+
+`level_setpoint → pid2.SV → pid2.MV → valve_1.target_opening → valve_1.current_opening → valve_1.outlet_flow → tank_1 → tank_2.level / pid2.PV`
+
+- 外部唯一可写过程输入：`level_setpoint`（FLOAT64）。
+- PID 只读状态：`pid2.SV`、`pid2.PV`、`pid2.MV`。
+- 阀门只读状态：`valve_1.target_opening`、`valve_1.current_opening`、`valve_1.outlet_flow`。
+- 过程输出：`tank_1.level`、`tank_2.level` 及出口流量。
+- 测试通过真实 OPC UA Write 请求验证 PID 状态、阀门状态、阀门出口流量和水箱液位均返回 `BadNotWritable`；只有 `level_setpoint` 写入被接受。
+
+周期为 0.5 s，入口流量为 0.0012 m³/s，阀门全行程时间为 12 s。初始阀门开度与 PID 输出偏置均为 23%；初始液位约为 tank 1 = 0.0621211 m、tank 2 = 0.09706422 m，设定值从 tank 2 的初始工作点开始。初始工作点按两级水箱出口流量关系计算，使启动时过程变量尽量接近平衡，减少启动瞬态对设定值阶跃证据的干扰。
+
+### 2. 真实客户端测试与断言
+
+测试：`tests/opcua_write.rs::opcua_pid_setpoint_controls_valve_and_two_tank_levels`
+
+环境：Windows、真实 `df-core Engine`、Runtime 实时调度、SignAndEncrypt / Basic256Sha256 OPC UA Server、独立 Writer `engineer` Client Session。
+
+1. 客户端读取初始 setpoint、PID PV/MV、阀门目标/实际开度及两级水箱液位。
+2. 将 `level_setpoint` 从约 0.09706422 m 上调至 0.40 m；Write 返回 Good 后，客户端经发布链确认 `level_setpoint` 和 `pid2.SV` 已更新。
+3. 验证 PID 输出、阀门目标开度、阀门实际开度和阀门出口流量增加；tank 1 和 tank 2 液位上升，PID PV 随 tank 2 液位更新。
+4. 将设定值下调至 0.20 m；验证 PID 输出、阀门目标开度、阀门实际开度和阀门出口流量下降。
+5. 由于阀门全行程时间和两级水箱的过程滞后，设定值下降后液位不会瞬时反向；测试不把瞬时反向作为通过条件。
+
+### 3. 实测读数（Windows Actions 日志）
+
+测试输出的代表性记录：
+
+```text
+PID_CLOSED_LOOP_EVIDENCE
+initial:
+  setpoint=0.097064
+  pv=0.097064
+  mv=23.000
+  valve=23.000
+  flow=0.000276
+  tank1=0.062121
+  tank2=0.097064
+
+step_up_response (setpoint=0.400000):
+  pv=0.107077
+  mv=43.532
+  target=43.532
+  opening=35.500
+  flow=0.000426
+  tank1=0.083614
+  tank2=0.107077
+
+step_up_followup:
+  mv=53.515
+  target=53.515
+  opening=53.515
+  flow=0.000642
+
+step_down (setpoint=0.200000):
+  mv=40.243
+  target=40.243
+  opening=45.182
+  flow=0.000542
+```
+
+读数表明：设定值上调后，PID 输出从 23.000 增至 43.532，后续达到 53.515；阀门实际开度从 23.000 增至 53.515，出口流量从 0.000276 增至 0.000642 m³/s，两个水箱液位均上升。设定值下调后，PID 输出/阀门目标降至 40.243，阀门实际开度随后降至 45.182，出口流量降至 0.000542 m³/s。这里的读数是一次测试运行样本，不是 PID 性能指标或稳定性保证。
+
+### 4. 执行结果与 CI
+
+代码与测试 Commit：`ddec2a2ece80c89ec7ec5130d9761107a9a20aa6`
+
+```text
+cargo fmt --all -- --check
+  → 通过（Rust CI）
+
+cargo test --workspace --locked
+  → Ubuntu / windows-latest 均通过（默认 feature）
+
+cargo test --locked -p df-runtime --features opcua --test opcua_write -- --list
+  → 聚焦 PID 集成测试存在性检查通过
+
+cargo test --locked -p df-runtime --features opcua --test opcua_write opcua_pid_setpoint_controls_valve_and_two_tank_levels -- --exact --nocapture
+  → 1 passed / 0 failed / 6 filtered out，24.86 s
+```
+
+- [Rust CI #41435107277](https://github.com/StupidArthur/datafactory_next/actions/runs/41437587420)：Ubuntu、Windows 默认工作区均通过。
+- [Runtime OPC UA PID closed-loop #41435107290](https://github.com/StupidArthur/datafactory_next/actions/runs/41437587512)：Windows 启用 `opcua` feature，先检查目标测试存在，再运行该单项真实客户端测试，成功。
+
+### 5. 首次失败与修正
+
+首次专项运行曾在读取 `tank_2.level` 刚越过阈值后，立即断言 `pid2.PV` 也已越过相同阈值时失败。原因是当前 Compiler / Engine 按 DSL `program` 列表中的节点顺序编译和执行：本例 PID 节点排在阀门、水箱节点之前，因此 PID PV 在本周期水箱更新前读取 `tank_2.level`，反馈表现为一个 Engine 周期的延迟。当前 Compiler 未将 `execute_first` 字段作为排序依据；本例的执行顺序来自 `program` 列表顺序。
+
+修正不是放宽阈值：测试增加独立等待，直到 `pid2.PV` 本身越过响应阈值，再读取后续控制状态。最终测试保持对 PV 上升的明确断言并通过。
+
+### 6. 边界说明
+
+- 该实施例验证了外部设定值 → PID → 阀门 → 双水箱 → PID PV 的实时响应链；没有把“液位已收敛到设定值”作为本轮验收结论。
+- PID 参数是演示性参数，不是实物辨识或工业整定结果；未验证抗积分饱和、扰动抑制、故障安全或 SIL。
+- 该专用 CI 只在 Windows 运行一个 OPC UA PID 集成测试；默认 Rust CI 在 Ubuntu / Windows 运行默认 feature 工作区测试。它不代表完整 `opcua` feature 测试电池已纳入双平台 CI。
+- R9 双实例测试仍是独立的本地 feature 验证；本轮没有将 R9 测试改成 CI 覆盖。
 
