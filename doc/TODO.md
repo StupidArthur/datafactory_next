@@ -334,6 +334,19 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
 - [~] RuntimeHandle 尚无真实外部消费者：OPC UA/HTTP 适配层在 R5–R8 接入，届时通过真实客户端验证 handle 的快照订阅与写入提交路径。
 - 证据：`doc/engineering/verification-log.md#2026-11-02-r1-验证`。
 
+### 2026-11-02：R2 验证（Runtime Host 配置 / 严格解析 / 路径解析 / 项目加载）
+
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test --workspace` 通过：68 个测试全部通过、0 失败、0 警告（df-core 19、df-core/rust_sdk 集成 3、df-runtime 41+2、df-sdk 3；df-runtime 新增 17 个 config 单元测试、7 个 loader 单元测试、2 个 host_config 集成测试）。
+- [x] 配置验收：未知字段拒绝（CFG 严格反序列化）；重复实例 ID 拒绝并指出 ID（CFG-02）；实例 ID 格式校验（空/非法字符/超长）；runtime_version 非支持版本拒绝；write_queue_capacity=0 拒绝；instances 为空拒绝。
+- [x] 路径解析（CFG-03）：相对路径以配置文件目录为基准解析为绝对路径（单元测试在 crate 工作目录下加载临时目录中的配置，验证与 CWD 无关）；绝对路径原样保留；Windows `\\?\` 扩展前缀被规范化，解析路径与普通路径可比较。
+- [x] 项目格式（CFG-04）：`.yaml/.yml` 经 `df_core::compile_source` 编译后 `Engine::from_bytes` 加载；`.dfproject` 经 `Engine::load` 加载；其他扩展名明确报错（含无扩展名）；损坏 YAML/损坏 dfproject 分别报告编译/引擎错误。
+- [x] OPC UA 配置：enabled=true 时校验 endpoint_url 必须为 opc.tcp（含 IPv6 字面量与端口合法性）、application_uri/namespace_uri 非空；Sign/SignAndEncrypt 必须配安全策略与证书/私钥文件（相对路径按配置目录解析且必须存在）；trust_list 路径解析；enabled=false 时保留结构不做端点校验。
+- [x] 示例夹具 `examples/host/runtime.yaml`（双实例 tank-a/tank-b，delay/catch_up 策略）由集成测试守卫：可加载、实例路径存在且两个项目均可编译为 Engine。
+- [x] Windows 真实引擎端到端：`df-runtime run examples/two-tank/project.yaml` 直接以 DSL v2 YAML 启动成功（约 2 秒推进 4 个周期、overrun=0、优雅停止退出码 0）；`.dfproject` 旧命令路径保持兼容（R1 e2e 与 loader 单元测试覆盖）。
+- [~] `df-runtime check --config` 与 `run --config` CLI 接线在 R4 实现，本阶段仅提供配置加载与校验 API。
+- 证据：`doc/engineering/verification-log.md#2026-11-02-r2-验证`。
+
 
 ## 13. Runtime 系统设计基线
 
@@ -341,7 +354,7 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
 - [x] 为配置/CLI、双时间调度、多实例、OPC UA 读取订阅、闭环写入、安全稳定性和性能建立分组验收项。
 - [ ] 按设计文档的 R1–R10 顺序推进实现；每项只有在代码、自动化测试和必要的端到端验证通过后才标记完成。
   - [x] R1 RuntimeHandle / Snapshot revision 与变更通知 / 写入请求状态（Queued/Applying/Applied/Rejected/Cancelled）/ 状态指标补齐（queue_depth、周期开始时间与调度延迟）。（2026-11-02，见 §12 R1 验证记录）
-  - [ ] R2 Runtime Host 配置结构、严格解析、路径处理与配置预检查（check 命令）。
+  - [x] R2 Runtime Host 配置结构、严格解析、路径处理与配置预检查（check 命令）。（2026-11-02，check CLI 接线归 R4）
   - [ ] R3 RuntimeManager 多实例生命周期与故障隔离。
   - [ ] R4 CLI Host 模式（run --config / check）、多实例状态与优雅停止。
   - [ ] R5 OPC UA 库 PoC、Endpoint 与安全配置。

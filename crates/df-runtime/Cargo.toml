@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 df-core = { path = "../df-core" }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
 
 [[bin]]
 name = "df-runtime"

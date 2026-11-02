@@ -1,0 +1,29 @@
+# DataFactory Runtime Host 示例：双水箱双实例
+# 相对路径以本文件所在目录为基准，不以启动时的工作目录为基准。
+# 两个实例加载同一个项目文件，各自拥有独立的 Engine、周期时钟与写入队列。
+runtime_version: 1
+
+opcua:
+  enabled: false
+  endpoint_url: "opc.tcp://127.0.0.1:4840"
+  application_uri: "urn:datafactory:runtime"
+  namespace_uri: "urn:datafactory:runtime"
+  security:
+    mode: None
+    policy: None
+    allow_anonymous: true
+
+instances:
+  - id: tank-a
+    project: "../two-tank/project.yaml"
+    enabled: true
+    scheduler:
+      overrun_policy: delay
+      write_queue_capacity: 256
+
+  - id: tank-b
+    project: "../two-tank/project.yaml"
+    enabled: true
+    scheduler:
+      overrun_policy: catch_up
+      write_queue_capacity: 256

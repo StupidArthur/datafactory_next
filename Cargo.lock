@@ -218,6 +218,8 @@ name = "df-runtime"
 version = "0.1.0"
 dependencies = [
  "df-core",
+ "serde",
+ "serde_yaml",
 ]
 
 [[package]]

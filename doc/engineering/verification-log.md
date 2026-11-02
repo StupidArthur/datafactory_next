@@ -110,3 +110,55 @@ stop → "runtime stopped"，退出码 0
 - `RuntimeHandle` 目前没有真实外部消费者；OPC UA/HTTP 适配层（R5–R8）接入后，通过真实 OPC UA 客户端验证快照订阅与写入提交路径。
 - `WriteRegistry` 容量修剪测试仅覆盖终态记录修剪路径；「排队中批次不被驱逐」由实现结构保证（修剪仅从终态记录中选取），未单独构造并发场景测试。
 
+## 2026-11-02：R2 验证（Runtime Host 配置 / 严格解析 / 路径解析 / 项目加载）
+
+范围：`crates/df-runtime` 新增 `src/config.rs`、`src/loader.rs`、`tests/host_config.rs`、`examples/host/runtime.yaml`；`Runtime::load` 改为经由统一加载器。
+
+### 1. 格式与工作区测试
+
+```text
+命令: cargo fmt --all -- --check
+结果: 通过（退出码 0）
+
+命令: cargo test --workspace
+结果: 通过（退出码 0，无警告）
+
+test result: ok. 19 passed; 0 failed  — df-core 单元测试
+test result: ok. 3 passed; 0 failed   — df-core Rust SDK 集成测试
+test result: ok. 41 passed; 0 failed  — df-runtime 单元测试（R1 后 17 + R2 新增 24）
+test result: ok. 2 passed; 0 failed   — df-runtime host_config 集成测试
+test result: ok. 3 passed; 0 failed   — df-sdk 单元测试
+合计: 68 passed / 0 failed
+```
+
+### 2. R2 新增测试清单（df-runtime）
+
+config.rs（17 个单元测试）：
+
+- 有效配置解析：默认值（enabled=true、overrun_policy=delay、write_queue_capacity=256）与显式值共存；项目路径解析为配置目录下的绝对路径。
+- 严格性：未知字段、重复实例 ID、非法 ID（空/含空格/超 64 字符）、runtime_version=2、write_queue_capacity=0、instances 为空均被拒绝并给出明确错误。
+- 路径解析（CFG-03）：相对路径以配置文件目录为基准（测试工作目录与配置目录不同），绝对路径保留；缺失项目文件、不支持的扩展名（.txt）被拒绝。
+- OPC UA：enabled=true 时 endpoint_url 必须 opc.tcp（http 被拒）；SignAndEncrypt+Basic256Sha256+证书/私钥/trust_list 相对路径解析且校验存在；Sign 模式缺证书被拒；mode 非 None 缺 policy 被拒；enabled=false 保留结构不做端点校验。
+- 端点矩阵：`opc.tcp://127.0.0.1:4840`、`opc.tcp://localhost`、`opc.tcp://[::1]:4840` 合法；`opc.tcp://0.0.0.0:0`、`http://...`、`opc.tcp://`、`opc.tcp://host:notaport` 非法。
+- 缺失配置文件报 `cannot read host config`。
+
+loader.rs（7 个单元测试）：YAML 编译加载并经实时调度推进 2 个周期；.dfproject 加载；.txt 与无扩展名拒绝；损坏 YAML 报编译错误；损坏 dfproject 报引擎错误；缺失文件报读取错误。
+
+tests/host_config.rs（2 个集成测试）：`examples/host/runtime.yaml` 可加载（CFG-01 语义），双实例 tank-a/tank-b 路径绝对且存在，策略 delay/catch_up 正确；两实例项目均可编译为 Engine（cycle_time=0.5s）。
+
+### 3. Windows 真实引擎端到端（YAML 直接启动）
+
+```text
+运行: target\debug\df-runtime.exe run examples\two-tank\project.yaml（不经 df-engine 预编译）
+status (≈2s): cycle_index=4 simulation_time=2s last_cycle=76.4µs max_cycle=96.1µs overruns=0 missed_deadlines=0
+stop → "runtime stopped"，退出码 0
+```
+
+`.dfproject` 旧命令（CLI-02）路径不变：`Runtime::load` 经统一加载器后仍走 `Engine::load`，由 loader 单元测试与 R1 e2e 覆盖。
+
+### 4. 边界说明（未验证项）
+
+- `df-runtime check --config` / `run --config` CLI 与多实例启动在 R3/R4 接线后做端到端验收；本阶段配置校验仅以库 API + 单元/集成测试验证。
+- OPC UA 安全配置仅做结构与文件存在性校验；证书生成、信任链与「非回环网卡不得使用不安全配置」在 R5 落地。
+
+

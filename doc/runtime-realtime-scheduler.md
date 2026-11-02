@@ -36,7 +36,7 @@ OPC UA/HTTP 适配层必须通过 `RuntimeHandle` 调用同一个 submit_writes�
 
 ## 使用方式
 
-先用现有编译器将 DSL v2 YAML 编译为 .dfproject：
+方式一（推荐部署路径）：先用现有编译器将 DSL v2 YAML 编译为 .dfproject：
 
 ```powershell
 df-engine compile .\project.yaml .\project.dfproject
@@ -47,6 +47,8 @@ df-engine compile .\project.yaml .\project.dfproject
 ```powershell
 df-runtime run .\project.dfproject
 ```
+
+方式二（R2 起）：`df-runtime run` 也可直接接受 DSL v2 YAML 源文件，Runtime 内部调用 Compiler 编译后启动，不产生临时文件。
 
 标准输入命令：
 

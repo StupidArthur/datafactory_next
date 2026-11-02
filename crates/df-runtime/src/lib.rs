@@ -8,8 +8,15 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
+mod config;
+mod loader;
 mod runtime_handle;
 
+pub use config::{
+    HostConfig, InstanceConfig, OpcUaConfig, OpcUaSecurityConfig, SchedulerConfig, SecurityMode,
+    SecurityPolicy,
+};
+pub use loader::load_engine;
 pub use runtime_handle::{RuntimeHandle, WaitOutcome, WriteState, WriteStatusInfo};
 use runtime_handle::{SnapshotFeed, WriteRegistry};
 
@@ -24,7 +31,8 @@ pub enum RuntimeState {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OverrunPolicy {
     /// Start the next period after the current cycle finishes.
     /// No model cycles are skipped, but simulation time can lag wall time.
@@ -91,6 +99,7 @@ pub enum RuntimeError {
     WriteRejected { code: i32, message: String },
     WriteCancelled,
     WorkerPanicked,
+    Config(String),
 }
 
 impl fmt::Display for RuntimeError {
@@ -110,6 +119,7 @@ impl fmt::Display for RuntimeError {
             }
             Self::WriteCancelled => write!(f, "write batch was cancelled before it was applied"),
             Self::WorkerPanicked => write!(f, "runtime worker panicked"),
+            Self::Config(message) => write!(f, "runtime host configuration error: {message}"),
         }
     }
 }
@@ -192,9 +202,10 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// Load a `.dfproject` or DSL v2 `.yaml`/`.yml` project and start a
+    /// realtime instance with default scheduler settings.
     pub fn load(project_path: &Path) -> Result<Self, RuntimeError> {
-        let engine =
-            Engine::load(project_path).map_err(|error| RuntimeError::Engine(error.to_string()))?;
+        let engine = loader::load_engine(project_path)?;
         Self::start(engine)
     }
 
