@@ -136,7 +136,7 @@ struct WriteFixture {
 
 impl Drop for WriteFixture {
     fn drop(&mut self) {
-        self.runtime.stop();
+        let _ = self.runtime.stop();
         self.server.stop();
     }
 }
@@ -196,7 +196,7 @@ fn start_fixture(
         instance_id: INSTANCE.into(),
         tags: engine.catalog().to_vec(),
     }];
-    let mut server = OpcUaServer::start_with_catalogs(&config, &catalogs).unwrap();
+    let server = OpcUaServer::start_with_catalogs(&config, &catalogs).unwrap();
     let runtime = Runtime::start_with_config(
         engine,
         RuntimeConfig {
