@@ -441,6 +441,17 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
 - [~] 边界（必须保留）：CI 只执行默认 feature 的 `cargo test --workspace --locked`，**不启用 `opcua` feature**；因此上面的双实例 OPC UA 集成测试是本地验证证据，不能表述为 CI 已覆盖 R8-B。`BadTimeout` 仍表示结果不确定；客户端经 OPC UA 查询超时写入最终状态仍为后续增强，本轮未实现。
 - 证据：`doc/engineering/verification-log.md#2026-11-02-r8-修正与验收windows-路径表示--实例级批次边界`。
 
+### 2026-11-02：R9 最小闭环验证（双水箱 / 双实例）
+
+- [x] 两个独立 `Runtime` 实例加载同一双水箱工程（`tank-a` / `tank-b`），挂接到同一个 SignAndEncrypt 服务端；两个独立 Client Session（`engineer`/Writer）分别连接并读取各自实例的 Tag。
+- [x] 向实例 A 的可写输入 `plant_inlet_flow` 写 0.004：Engine 确认后返回 Good，经发布链回读到 0.004；随后 `tank_1.level` 高于初值（CL-01 真实闭环，非回放）。
+- [x] 第二次改设定值为 0.006，回读 0.006——输出随当前模型计算变化（CL-02）。
+- [x] 实例 B 隔离：B 的 `plant_inlet_flow` 客户端读值、B 引擎快照均保持 0.0012，A 引擎快照为 0.006；B 的 `tank_1.level` 仍由自身模型推进（高于自身初值），且与 A 的液位不相等，说明两边不共享状态。
+- [x] 资源释放：停止实例 A 后其写入返回 `BadOutOfService`，同一服务端上实例 B 仍可正常读；停止服务端后端点端口不再接受连接；夹具 Drop 对已停止的 runtime/server 幂等。
+- [x] 测试：`cargo test -p df-runtime --features opcua --test opcua_write` → 6 passed / 0 failed（约 22 s，含本项约 12 s）；`cargo fmt --all -- --check` 通过。
+- [~] 边界：CL-03（客户端侧查询 `effective_cycle_index`）未实现——R8-C 明确本轮不新增 OPC UA 诊断节点/查询服务，`WriteReceipt` 仅 Runtime 内部可见；UA-02 Browse 层级、UA-05 完整客户端类型矩阵、取消路径仍未覆盖；本项为**本地聚焦验证**，CI 未启用 `opcua` feature，不能表述为 CI 覆盖。
+- 证据：`doc/engineering/verification-log.md#2026-11-02-r9-最小闭环验证双水箱--双实例`。
+
 
 ## 13. Runtime 系统设计基线
 
@@ -455,7 +466,7 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
   - [x] R6 Tag Catalog → NodeId/Variant/AccessLevel 映射。（2026-11-02，见 §12 R6 验证记录）
   - [x] R7 Snapshot 周期发布与订阅通知。（2026-11-02，见 §12 R7 验证记录；含 R1 停机协议顺序修复）
   - [x] R8 OPC UA Write Handler、批次聚合、确认与取消。（2026-11-02，见 §12 R8 验证记录；含 CLI 退出码 4/5 接线与首次真实触发；R8 修正与验收见 §12「R8 修正与验收」）
-  - [ ] R9 双水箱闭环案例与独立客户端自动化测试。
+  - [x] R9 双水箱闭环案例与独立客户端自动化测试。（2026-11-02，见 §12 R9 最小闭环验证；CL-03 客户端侧诊断仍为后续增强）
   - [ ] R10 Monitor 指标、报警、归档。
 
 设计文档：[doc/runtime-system-design.md](runtime-system-design.md)

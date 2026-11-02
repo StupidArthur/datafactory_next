@@ -599,6 +599,41 @@ GitHub Actions [Rust CI #41417657194](https://github.com/StupidArthur/datafactor
 - 本轮未运行约 62 秒的完整 `--features opcua` 测试电池，只运行了 `opcua::write::tests` 与 `tests/opcua_write.rs` 两个聚焦目标。
 - 取消路径、UA-02 Browse、UA-05 客户端矩阵等边界沿用上文 R8 记录，归 R9 或后续轮次。
 
+## 2026-11-02：R9 最小闭环验证（双水箱 / 双实例）
+
+本轮只做入口文档 §4 的六个步骤，不扩展为通用测试平台；复用 R8 的双实例夹具与客户端辅助函数。
+
+### 1. 场景与断言（tests/opcua_write.rs::two_tank_closed_loop_is_isolated_between_two_instances）
+
+环境：同一双水箱工程由两个独立 Engine 加载（`tank-a` / `tank-b`），两个独立 `Runtime`，一个 SignAndEncrypt 服务端，两个独立 Client Session（均为 Writer `engineer`）。
+
+1. 启动与读取：两个 session 分别读取各自实例的 `plant_inlet_flow` 与 `tank_1.level`；两边初始输入均为 0.0012、初始液位一致。
+2. 写入实例 A：`plant_inlet_flow` ← 0.004，返回 Good（Engine 周期边界确认后），随后经发布链回读 0.004（WR-07 证据链）。
+3. 模型响应：`tank_1.level` 上升到高于初值（CL-01：设定值进入 Engine，输出由模型计算得出）。
+4. 非回放：再次写 0.006 并回读 0.006，证明输出跟随当前输入变化（CL-02）。
+5. 实例 B 隔离：
+   - 客户端读 B 的 `plant_inlet_flow` 仍为 0.0012；
+   - B 的 Engine 快照输入为 0.0012，A 的 Engine 快照输入为 0.006（不存在跨实例写入）；
+   - B 的 `tank_1.level` 仍由自身模型推进（高于自身初值），且与 A 的当前液位不相等。
+6. 资源释放：`runtime_a.stop()` 后对 A 的写入返回 `BadOutOfService`，同一服务端上 B 仍可正常读；`server.stop()` 后端点端口在 5 s 内停止接受连接；夹具 `Drop` 对已停止的 runtime/server 幂等。
+
+说明：`tank_1.level` 是模型派生输出，B 的液位在自身输入下也会持续变化，因此隔离断言不采用“B 液位不变”，而是直接断言 B 的输入未被改动（客户端 + Engine 快照）并确认 B 仍在产出自身模型结果。
+
+### 2. 执行结果（Windows 本地）
+
+```
+cargo fmt --all -- --check                                    → 通过
+cargo test -p df-runtime --features opcua --test opcua_write  → 6 passed / 0 failed（约 22 s）
+  （本项单独运行约 12 s）
+```
+
+### 3. 边界说明（未覆盖）
+
+- **CL-03 未实现**：客户端无法查询 `effective_cycle_index`。R8-C 已明确本轮不新增 OPC UA 诊断节点/查询服务，`WriteReceipt` 只在 Runtime 内部可见；本轮以“Good 仅在 Engine 确认后返回 + 回读值”作为生效证据。
+- UA-02（Browse Instances/Tags 层级）与 UA-05 完整客户端类型矩阵、§8.5.3 取消路径仍未做。
+- 本项是**本地聚焦验证**：CI 只跑默认 feature，未启用 `opcua`，因此该测试不在 CI 覆盖范围内。
+- 未启动 Studio，未构建外部进程编排系统，未跑完整 `--features opcua` 测试电池。
+
 
 
 

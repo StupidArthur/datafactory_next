@@ -18,7 +18,10 @@
 //! 4. stopping the instance rejects later writes and discards pending
 //!    batches without applying them (WR-09),
 //! 5. one request spanning two instances: instance A's invalid tag withholds
-//!    only A's batch while instance B's valid batch commits (§8.3).
+//!    only A's batch while instance B's valid batch commits (§8.3),
+//! 6. the R9 dual-tank closed loop: two instances, two independent client
+//!    sessions, a setpoint write on A that the model responds to, and B
+//!    isolated from it (CL-01/CL-02).
 //!
 //! Certificate and PKI handling follows the proven R5/R7 pattern: every
 //! fixture generates a fresh sample keypair for the server, and every client
@@ -727,6 +730,144 @@ async fn stopped_instances_reject_writes_and_pending_batches_are_discarded() {
     );
 
     engineer.disconnect().await.unwrap();
+}
+
+/// R9 minimal closed loop (CL-01/CL-02): two independent runtimes load the
+/// two-tank project, two independent client sessions read both instances, a
+/// Writer sets instance A's inlet, the model responds with a rising level,
+/// and instance B keeps its own state. The runtimes and the server are then
+/// stopped and the port is released.
+#[tokio::test]
+async fn two_tank_closed_loop_is_isolated_between_two_instances() {
+    let mut fixture = start_dual_fixture("r9_loop", &two_tank_project(), 256);
+    // Two independent sessions, one per instance (§4.2 of the round entry).
+    let session_a = connect_user(
+        "r9_session_a",
+        "engineer",
+        "engineer-pw",
+        &fixture.endpoint_url,
+    )
+    .await;
+    let session_b = connect_user(
+        "r9_session_b",
+        "engineer",
+        "engineer-pw",
+        &fixture.endpoint_url,
+    )
+    .await;
+
+    let inlet_a = fixture.tag(INSTANCE, INLET);
+    let level_a = fixture.tag(INSTANCE, LEVEL);
+    let inlet_b = fixture.tag(SECOND_INSTANCE, INLET);
+    let level_b = fixture.tag(SECOND_INSTANCE, LEVEL);
+
+    // Both instances start from the same project state.
+    let initial_b = read_values(&session_b, &[inlet_b.clone(), level_b.clone()]).await;
+    assert_eq!(initial_b[0].status, Some(opcua::types::StatusCode::Good));
+    assert!((as_double(&initial_b[0]) - INITIAL_INLET).abs() < 1e-9);
+    let initial_level_b = as_double(&initial_b[1]);
+    let initial_level_a = as_double(&read_values(&session_a, &[level_a.clone()]).await[0]);
+    assert!((initial_level_a - initial_level_b).abs() < 1e-9);
+
+    // CL-01: the setpoint enters the engine and the write is confirmed only
+    // after the cycle-boundary acknowledgement.
+    let status = write_one(&session_a, &inlet_a, double_value(0.004)).await;
+    assert!(
+        status.is_good(),
+        "the setpoint write must succeed: {status:?}"
+    );
+    wait_for_value(&session_a, &inlet_a, 0.004).await;
+
+    // CL-02: the response comes from the running model, not from a replay —
+    // tank A's level rises after the setpoint change.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let values = read_values(&session_a, &[level_a.clone()]).await;
+        if values[0].status == Some(opcua::types::StatusCode::Good)
+            && as_double(&values[0]) > initial_level_a + 1e-4
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "tank A's level must rise after the setpoint change, got {:?}",
+            values[0]
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // A second setpoint change keeps tracking the model (not a fixed script).
+    let status = write_one(&session_a, &inlet_a, double_value(0.006)).await;
+    assert!(
+        status.is_good(),
+        "the second setpoint write must succeed: {status:?}"
+    );
+    wait_for_value(&session_a, &inlet_a, 0.006).await;
+
+    // Instance B never saw A's setpoint: the written tag still carries B's own
+    // value in the client read, in B's engine snapshot, and A's snapshot
+    // carries A's. Level is a derived output that keeps evolving in both
+    // engines, so it is compared against its own initial state instead.
+    let after_b = read_values(&session_b, &[inlet_b.clone(), level_b.clone()]).await;
+    assert_eq!(after_b[0].status, Some(opcua::types::StatusCode::Good));
+    assert!(
+        (as_double(&after_b[0]) - INITIAL_INLET).abs() < 1e-9,
+        "instance B's inlet must stay at its own value, got {:?}",
+        after_b[0]
+    );
+    assert!(
+        (fixture.applied_inlet(SECOND_INSTANCE) - INITIAL_INLET).abs() < 1e-9,
+        "instance B's engine must not receive instance A's setpoint, got {}",
+        fixture.applied_inlet(SECOND_INSTANCE)
+    );
+    assert!(
+        (fixture.applied_inlet(INSTANCE) - 0.006).abs() < 1e-9,
+        "instance A's engine must keep its own setpoint, got {}",
+        fixture.applied_inlet(INSTANCE)
+    );
+    assert!(
+        as_double(&after_b[1]) > initial_level_b + 1e-6,
+        "instance B must keep producing its own model output, got {:?}",
+        after_b[1]
+    );
+    let level_a_now = as_double(&read_values(&session_a, &[level_a.clone()]).await[0]);
+    assert!(
+        (as_double(&after_b[1]) - level_a_now).abs() > 1e-3,
+        "the two instances must not share level state: B {:?} vs A {level_a_now}",
+        after_b[1]
+    );
+
+    // Stopping instance A rejects further writes; the server and instance B
+    // keep running independently.
+    fixture.runtime_a.stop().unwrap();
+    let status = write_one(&session_a, &inlet_a, double_value(0.002)).await;
+    assert!(
+        status == opcua::types::StatusCode::BadOutOfService,
+        "writes into the stopped instance must be BadOutOfService, got {status:?}"
+    );
+    let still_running = read_values(&session_b, &[inlet_b.clone()]).await;
+    assert_eq!(
+        still_running[0].status,
+        Some(opcua::types::StatusCode::Good)
+    );
+
+    session_a.disconnect().await.unwrap();
+    session_b.disconnect().await.unwrap();
+
+    // Stopping the server releases the endpoint: the port stops accepting.
+    let address = fixture
+        .endpoint_url
+        .trim_start_matches("opc.tcp://")
+        .to_string();
+    fixture.server.stop();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::net::TcpStream::connect(&address).is_ok() {
+        assert!(
+            Instant::now() < deadline,
+            "the endpoint must stop accepting connections after stop"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// §8.3: atomicity is per instance, not per OPC UA Write request. One request
