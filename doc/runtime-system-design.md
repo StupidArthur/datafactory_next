@@ -2,7 +2,7 @@
 
 > 文档状态：设计基线 v1.0  
 > 更新日期：2026-11-02  
-> 适用分支：`feature/datafactory-runtime-foundation`  
+> 适用分支：`main`  
 > 设计对象：Rust Engine、Runtime CLI、Runtime Host、多组态实例管理、OPC UA 实时数据发布与闭环写入  
 > 说明：本文是后续实现的技术设计和验收依据，不代表文中规划功能已经实现或通过测试。
 

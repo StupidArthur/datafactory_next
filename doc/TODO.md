@@ -299,9 +299,9 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
 - [~] 增加 Delay / CatchUp 两种超时策略，模型周期不跳步。
 - [~] 增加有界 FIFO 写入队列、周期边界原子写入及写入确认。
 - [~] 增加最新 Snapshot 发布、运行状态和执行耗时统计。
-- [~] 增加单元测试，但尚未在本环境执行编译和测试，因此不标记为完成。
-- [ ] 完成 Cargo 格式检查、工作区编译和全部测试。
-- [ ] 在 Windows 环境验证 Runtime 启动、写入、停止和持续运行。
+- [~] 增加 Cargo 单元测试，全部通过（见下方 2026-11-02 验证记录）。
+- [x] 完成 Cargo 格式检查、工作区编译和全部测试。
+- [~] 在 Windows 环境验证 Runtime 启动、停止和持续运行；真实引擎上的外部写入闭环验收归入 R8/R9（当前 CLI 无写入命令）。
 
 **当前边界：** 目前实现的是单个 Engine 实例的实时调度核心，不包含独立 CLI、多组态实例管理和 OPC UA。后续 OPC UA 必须通过 Runtime 写入队列进入 Engine，不能直接改写模型状态。
 
@@ -312,8 +312,18 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
 - [~] 增加 stdin status/snapshot/stop 控制命令，关闭输入流时执行清理。
 - [ ] 增加 Windows 服务/信号优雅停止机制。
 - [ ] 增加 YAML 直接启动流程（内部调用现有 Compiler 生成临时或发布的 dfproject）。
-- [ ] 实际执行 cargo fmt --check、cargo check --workspace 和 cargo test --workspace。
-- [ ] 在 Windows 目标环境进行真实项目持续运行和写入闭环验收。
+- [x] 实际执行 cargo fmt --check 和 cargo test --workspace（含全工作区编译；见 2026-11-02 验证记录）。
+- [~] 在 Windows 目标环境验证了真实项目启动、实时推进与优雅停止；写入闭环验收与 R8/R9 一并执行。
+
+
+### 2026-11-02：Runtime 首轮验证（Windows / rustc 1.99.1 msvc）
+
+- [x] `cargo fmt --all -- --check` 通过，无格式差异。
+- [x] `cargo test --workspace` 通过：33 个测试全部通过、0 失败（df-core 19、df-core/rust_sdk 集成 3、df-runtime 8、df-sdk 3）。
+- [x] Windows 真实引擎端到端：`df-engine compile` 编译 `examples/two-tank/project.yaml` 后由 `df-runtime run` 启动实时调度；约 2.5 秒墙钟推进 5 个模型周期（cycle_index=5、simulation_time=2.5s，与 cycle_time=0.5s 严格一致；overrun=0、missed_deadlines=0）；tank_1.level 0.1500→0.1767、tank_2.level 0.1000→0.1057，流量沿 plant_inlet_flow→tank_1→tank_2 正确传递；stdin 的 status/snapshot/stop 均正常，进程退出码 0。
+- [~] 真实引擎上的外部写入尚未端到端验证：当前 Runtime CLI 没有写入命令；写入确认/原子拒绝/队列容量/停止拒绝语义目前由 df-runtime 单元测试（FakeEngine）覆盖，真实闭环写入验收归入 R8/R9。
+- [x] 环境修复：移除 datafactory-next 目录上误设的 rustup 目录覆盖（stable-x86_64-pc-windows-gnu；其 TDM-GCC 10.3 链接器缺 libgcc_eh 导致无法链接），恢复默认 stable-x86_64-pc-windows-msvc。
+- 证据：`doc/engineering/verification-log.md#2026-11-02-runtime-首轮验证`；命令与输出以该台账为准。
 
 
 ## 13. Runtime 系统设计基线
@@ -321,5 +331,15 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
 - [x] 完成 Runtime 多实例与 OPC UA 闭环系统设计文档，明确当前代码基线、目标架构、模块接口、运行时序、写入语义、安全边界、异常处理和分阶段实现顺序。
 - [x] 为配置/CLI、双时间调度、多实例、OPC UA 读取订阅、闭环写入、安全稳定性和性能建立分组验收项。
 - [ ] 按设计文档的 R1–R10 顺序推进实现；每项只有在代码、自动化测试和必要的端到端验证通过后才标记完成。
+  - [ ] R1 RuntimeHandle / Snapshot revision 与变更通知 / 写入请求状态（Queued/Applying/Applied/Rejected/Cancelled）/ 状态指标补齐（queue_depth、周期开始时间与调度延迟）。
+  - [ ] R2 Runtime Host 配置结构、严格解析、路径处理与配置预检查（check 命令）。
+  - [ ] R3 RuntimeManager 多实例生命周期与故障隔离。
+  - [ ] R4 CLI Host 模式（run --config / check）、多实例状态与优雅停止。
+  - [ ] R5 OPC UA 库 PoC、Endpoint 与安全配置。
+  - [ ] R6 Tag Catalog → NodeId/Variant/AccessLevel 映射。
+  - [ ] R7 Snapshot 周期发布与订阅通知。
+  - [ ] R8 OPC UA Write Handler、批次聚合、确认与取消。
+  - [ ] R9 双水箱闭环案例与独立客户端自动化测试。
+  - [ ] R10 Monitor 指标、报警、归档。
 
 设计文档：[doc/runtime-system-design.md](runtime-system-design.md)
