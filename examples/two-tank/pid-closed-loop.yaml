@@ -20,7 +20,6 @@ program:
     display_args: ["level_setpoint[1.2]"]
   - name: pid2
     type: PID
-    execute_first: true
     params:
       PB: 1.5
       TI: 30.0
