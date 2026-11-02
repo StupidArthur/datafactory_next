@@ -634,7 +634,7 @@ cargo test -p df-runtime --features opcua --test opcua_write  → 6 passed / 0 f
 - 本项是**本地聚焦验证**：CI 只跑默认 feature，未启用 `opcua`，因此该测试不在 CI 覆盖范围内。
 - 未启动 Studio，未构建外部进程编排系统，未跑完整 `--features opcua` 测试电池。
 
-## 2026-11-02：R10 外部 PID 设定值双水箱闭环实施例
+## 2026-11-02：外部 PID 设定值双水箱闭环补充实施例
 
 本轮在 R9 双实例过程输入闭环之外，增加一个独立的 PID 控制实施例，验证外部 OPC UA 设定值经过 PID 和阀门后，驱动串联双水箱过程变量变化。实现范围限于示范工程、真实客户端集成测试和聚焦 CI，不扩展 Runtime / OPC UA 运行时接口。
 
@@ -724,7 +724,7 @@ cargo test --locked -p df-runtime --features opcua --test opcua_write opcua_pid_
 
 ### 5. 首次失败与修正
 
-首次专项运行曾在读取 `tank_2.level` 刚越过阈值后，立即断言 `pid2.PV` 也已越过相同阈值时失败。原因是 PID 以 `execute_first: true` 在水箱组件前执行，PID PV 在一个 Engine 周期内反映的是本周期水箱更新前的测量值，存在一个周期的反馈延迟。
+首次专项运行曾在读取 `tank_2.level` 刚越过阈值后，立即断言 `pid2.PV` 也已越过相同阈值时失败。原因是当前 Compiler / Engine 按 DSL `program` 列表中的节点顺序编译和执行：本例 PID 节点排在阀门、水箱节点之前，因此 PID PV 在本周期水箱更新前读取 `tank_2.level`，反馈表现为一个 Engine 周期的延迟。当前 Compiler 未将 `execute_first` 字段作为排序依据；本例的执行顺序来自 `program` 列表顺序。
 
 修正不是放宽阈值：测试增加独立等待，直到 `pid2.PV` 本身越过响应阈值，再读取后续控制状态。最终测试保持对 PV 上升的明确断言并通过。
 
