@@ -2,7 +2,7 @@
 //!
 //! One thread per attached instance blocks on the instance's snapshot feed
 //! and batch-writes the new snapshot values plus the instance status nodes
-//! into the address space with `SimpleNodeManager::set_values` (a single
+//! into the address space with `InMemoryNodeManager::set_values` (a single
 //! address-space write lock per cycle, so clients never observe a torn mix
 //! of two cycles). A shared thread keeps the server status folder honest.
 //!
@@ -15,7 +15,6 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use opcua::server::node_manager::memory::SimpleNodeManager;
 use opcua::server::SubscriptionCache;
 use opcua::types::{DataValue, DateTime, NodeId, StatusCode, UAString, Variant};
 
@@ -23,6 +22,7 @@ use crate::{RuntimeError, RuntimeHandle, RuntimeState, RuntimeStatus, WaitOutcom
 
 use super::address_space::InstanceNodes;
 use super::value::value_to_variant;
+use super::write::RuntimeNodeManager;
 use super::OpcUaServer;
 
 /// How often the publisher re-checks instance status between snapshot
@@ -126,7 +126,7 @@ fn wait_for_terminal_status(handle: &RuntimeHandle, limit: Duration) -> RuntimeS
 /// a single `set_values` call: one address-space write lock, so a client
 /// reading several tags mid-publish sees one consistent cycle (§14.4 UA-08).
 fn publish_instance(
-    node_manager: &SimpleNodeManager,
+    node_manager: &RuntimeNodeManager,
     subscriptions: &SubscriptionCache,
     nodes: &InstanceNodes,
     handle: &RuntimeHandle,
@@ -166,7 +166,7 @@ fn publish_instance(
 fn instance_publisher_loop(
     stop: Arc<AtomicBool>,
     refresh: Duration,
-    node_manager: Arc<SimpleNodeManager>,
+    node_manager: Arc<RuntimeNodeManager>,
     subscriptions: Arc<SubscriptionCache>,
     nodes: InstanceNodes,
     handle: RuntimeHandle,
@@ -215,7 +215,7 @@ fn instance_publisher_loop(
 fn server_status_loop(
     stop: Arc<AtomicBool>,
     refresh: Duration,
-    node_manager: Arc<SimpleNodeManager>,
+    node_manager: Arc<RuntimeNodeManager>,
     subscriptions: Arc<SubscriptionCache>,
     server_status: std::collections::BTreeMap<String, NodeId>,
     handles: Vec<RuntimeHandle>,

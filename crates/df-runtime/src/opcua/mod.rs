@@ -13,6 +13,7 @@
 pub mod address_space;
 pub mod publisher;
 pub mod value;
+pub mod write;
 
 pub use address_space::{
     validate_catalogs, AddressSpaceIndex, InstanceCatalog, InstanceNodes, TagEntry,
@@ -23,7 +24,15 @@ pub use value::{
     percent_encode, status_node_identifier, tag_node_identifier, ua_data_type, value_to_variant,
     variant_to_value,
 };
+pub use write::{RuntimeNodeManager, WriteHandlerState};
 
+// Secrets resolution lives in config.rs so the CLI preflight can use it
+// without the opcua feature; re-exported here for the serving layer's users.
+pub use crate::config::{
+    resolve_user_credentials, OpcUaUserConfig, PlainUserCredentials, UserRole,
+};
+
+use std::collections::BTreeMap;
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,8 +41,6 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use opcua::crypto::SecurityPolicy as UaSecurityPolicy;
-use opcua::server::diagnostics::NamespaceMetadata;
-use opcua::server::node_manager::memory::{simple_node_manager, SimpleNodeManager};
 use opcua::server::{
     Server, ServerBuilder, ServerHandle, ServerUserToken, SubscriptionCache,
     ANONYMOUS_USER_TOKEN_ID,
@@ -46,8 +53,10 @@ use crate::config::{
     SecurityPolicy as HostSecurityPolicy,
 };
 use crate::RuntimeError;
+use crate::RuntimeHandle;
 
 use address_space::build_address_space;
+use write::runtime_node_manager;
 
 /// Port used when the endpoint URL omits one (the OPC UA default port).
 pub const DEFAULT_OPC_UA_PORT: u16 = 4840;
@@ -55,17 +64,6 @@ pub const DEFAULT_OPC_UA_PORT: u16 = 4840;
 /// How long `OpcUaServer::start` waits for the endpoint to accept TCP
 /// connections before the start is reported as failed.
 const TCP_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// Username/password credentials accepted by the server in addition to
-/// anonymous access.
-///
-/// R5 proof-of-concept only: the Host configuration gains user definitions
-/// (sourced from environment variables, design §9.1) in R8.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlainUserCredentials {
-    pub username: String,
-    pub password: String,
-}
 
 /// Parse `opc.tcp://host[:port][/path]` into a bind host and port. Structural
 /// URL validation is shared with `config.rs`.
@@ -133,21 +131,23 @@ fn default_pki_dir() -> PathBuf {
 /// has been built.
 struct ServerReady {
     namespace_index: u16,
-    node_manager: Arc<SimpleNodeManager>,
+    node_manager: Arc<RuntimeNodeManager>,
+    write_state: Arc<WriteHandlerState>,
     subscriptions: Arc<SubscriptionCache>,
     stop_token: CancellationToken,
     address_space: AddressSpaceIndex,
 }
 
-/// Create the server from the Host configuration, instance catalogs and
-/// user credentials.
+/// Create the server from the Host configuration, instance catalogs, user
+/// credentials and the shared write-handler state.
 ///
 /// Runs on the OPC UA thread inside the tokio runtime context because
 /// `ServerBuilder::build` creates tokio synchronization primitives.
 fn build_server(
     config: &OpcUaConfig,
     catalogs: &[InstanceCatalog],
-    users: &[PlainUserCredentials],
+    users: &[crate::config::PlainUserCredentials],
+    write_state: Arc<WriteHandlerState>,
     host: &str,
     port: u16,
 ) -> Result<(Server, ServerHandle, ServerReady), String> {
@@ -170,10 +170,12 @@ fn build_server(
         ),
     };
 
-    // The configured endpoint. Anonymous access is always advertised for the
-    // R5 proof of concept; user/password tokens are added on top. R8 wires
-    // `allow_anonymous` into a custom authenticator.
-    let mut user_ids = vec![ANONYMOUS_USER_TOKEN_ID.to_string()];
+    // Anonymous access is advertised only when the configuration allows it;
+    // configured username/password users are added on top (§9.1).
+    let mut user_ids = Vec::new();
+    if config.security.allow_anonymous {
+        user_ids.push(ANONYMOUS_USER_TOKEN_ID.to_string());
+    }
     for user in users {
         user_ids.push(user.username.clone());
     }
@@ -191,12 +193,9 @@ fn build_server(
         .host(host.to_string())
         .port(port)
         .discovery_urls(vec![config.endpoint_url.clone()])
-        .with_node_manager(simple_node_manager(
-            NamespaceMetadata {
-                namespace_uri: config.namespace_uri.clone(),
-                ..Default::default()
-            },
-            "datafactory",
+        .with_node_manager(runtime_node_manager(
+            &config.namespace_uri,
+            write_state.clone(),
         ));
 
     for user in users {
@@ -219,30 +218,33 @@ fn build_server(
         .default_endpoint("datafactory");
 
     let (server, handle) = builder.build()?;
-    let ready = populate_address_space(&handle, config, catalogs)?;
+    let ready = populate_address_space(&handle, config, catalogs, &write_state)?;
     Ok((server, handle, ready))
 }
 
 /// Resolve the namespace and build the §7.2 address space from the instance
-/// Tag Catalogs.
+/// Tag Catalogs; mirror the catalog facts into the write handler.
 fn populate_address_space(
     handle: &ServerHandle,
     config: &OpcUaConfig,
     catalogs: &[InstanceCatalog],
+    write_state: &Arc<WriteHandlerState>,
 ) -> Result<ServerReady, String> {
     let namespace_index = handle
         .get_namespace_index(&config.namespace_uri)
         .ok_or_else(|| format!("namespace {} was not registered", config.namespace_uri))?;
     let node_manager = handle
         .node_managers()
-        .get_of_type::<SimpleNodeManager>()
-        .ok_or_else(|| "the simple node manager is missing from the server".to_string())?;
+        .get_of_type::<RuntimeNodeManager>()
+        .ok_or_else(|| "the datafactory node manager is missing from the server".to_string())?;
 
     let address_space = build_address_space(&node_manager, namespace_index, catalogs)?;
+    write_state.load_address_space(&address_space);
 
     Ok(ServerReady {
         namespace_index,
         node_manager,
+        write_state: write_state.clone(),
         subscriptions: handle.subscriptions().clone(),
         stop_token: handle.token().clone(),
         address_space,
@@ -257,40 +259,51 @@ fn populate_address_space(
 pub struct OpcUaServer {
     endpoint_url: String,
     namespace_index: u16,
-    node_manager: Arc<SimpleNodeManager>,
+    node_manager: Arc<RuntimeNodeManager>,
+    write_state: Arc<WriteHandlerState>,
     subscriptions: Arc<SubscriptionCache>,
     address_space: AddressSpaceIndex,
     stop_token: CancellationToken,
+    /// Set once the server thread finished, feeding `is_running`.
+    finished: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl OpcUaServer {
     /// Start the OPC UA server described by `config` without instance nodes.
     pub fn start(config: &OpcUaConfig) -> Result<Self, RuntimeError> {
-        Self::start_with_catalogs(config, &[], &[])
-    }
-
-    /// Start the server with additional username/password credentials.
-    pub fn start_with_users(
-        config: &OpcUaConfig,
-        users: &[PlainUserCredentials],
-    ) -> Result<Self, RuntimeError> {
-        Self::start_with_catalogs(config, &[], users)
+        Self::start_with_catalogs(config, &[])
     }
 
     /// Start the server and build the §7.2 address space for the given
     /// instance Tag Catalogs.
     ///
-    /// The §9.1 security rules are re-checked here at start time.
+    /// User credentials come from the configuration (`opcua.security.users`);
+    /// their passwords are resolved from the environment here (§9.1). The
+    /// §9.1 security rules are re-checked at start time. Runtimes are
+    /// attached separately via `attach_runtimes`; until then every write
+    /// answers `BadOutOfService`.
     pub fn start_with_catalogs(
         config: &OpcUaConfig,
         catalogs: &[InstanceCatalog],
-        users: &[PlainUserCredentials],
     ) -> Result<Self, RuntimeError> {
         if !config.enabled {
             return Err(RuntimeError::Config("opcua service is not enabled".into()));
         }
         validate_opcua_security(config)?;
+        let users = resolve_user_credentials(&config.security)?;
+        // §8.5: optional write-wait override from the Host configuration.
+        let wait_override = config
+            .write_wait_timeout_ms
+            .map(|ms| Duration::from_millis(ms));
+        let roles: BTreeMap<String, crate::config::UserRole> = config
+            .security
+            .users
+            .iter()
+            .map(|user| (user.username.clone(), user.role))
+            .collect();
+        let write_state = Arc::new(WriteHandlerState::new(roles, wait_override));
+
         let (host, port) = parse_endpoint(&config.endpoint_url)?;
         let endpoint_url = config.endpoint_url.clone();
 
@@ -300,7 +313,8 @@ impl OpcUaServer {
 
         let thread_config = config.clone();
         let thread_catalogs = catalogs.to_vec();
-        let thread_users = users.to_vec();
+        let thread_users = users;
+        let thread_write_state = write_state.clone();
         let thread_host = host.clone();
         let thread_finished = Arc::clone(&finished);
         let thread_run_error = Arc::clone(&run_error);
@@ -323,6 +337,7 @@ impl OpcUaServer {
                         &thread_config,
                         &thread_catalogs,
                         &thread_users,
+                        thread_write_state,
                         &thread_host,
                         port,
                     );
@@ -421,9 +436,11 @@ impl OpcUaServer {
             endpoint_url,
             namespace_index: ready.namespace_index,
             node_manager: ready.node_manager,
+            write_state: ready.write_state,
             subscriptions: ready.subscriptions,
             address_space: ready.address_space,
             stop_token: ready.stop_token,
+            finished,
             thread: Some(thread),
         })
     }
@@ -438,9 +455,14 @@ impl OpcUaServer {
         self.namespace_index
     }
 
-    /// The simple node manager backing the address space.
-    pub fn node_manager(&self) -> &Arc<SimpleNodeManager> {
+    /// The node manager backing the address space.
+    pub fn node_manager(&self) -> &Arc<RuntimeNodeManager> {
         &self.node_manager
+    }
+
+    /// The shared write-handler state (node maps, roles, runtime handles).
+    pub fn write_state(&self) -> &Arc<WriteHandlerState> {
+        &self.write_state
     }
 
     /// Subscription cache used to notify monitoring clients.
@@ -453,12 +475,42 @@ impl OpcUaServer {
         &self.address_space
     }
 
+    /// Attach runtime handles so writes flow into the running instances.
+    ///
+    /// Every instance id must exist in the address space index; unknown ids
+    /// are rejected so a typo cannot silently black-hole writes. Existing
+    /// attachments for the same instance are replaced.
+    pub fn attach_runtimes(
+        &self,
+        runtimes: &[(String, RuntimeHandle)],
+    ) -> Result<(), RuntimeError> {
+        for (instance_id, _) in runtimes {
+            if !self.address_space.instances.contains_key(instance_id) {
+                return Err(RuntimeError::Config(format!(
+                    "cannot attach runtime {instance_id}: no such opcua instance"
+                )));
+            }
+        }
+        self.write_state.attach_runtimes(runtimes);
+        Ok(())
+    }
+
+    /// `true` while the server thread has not finished. A mid-run server
+    /// death (endpoint failure) flips this and the Host stops with exit
+    /// code 5 (§12.2).
+    pub fn is_running(&self) -> bool {
+        !self.finished.load(Ordering::SeqCst)
+    }
+
     /// Stop the server and wait for its thread to exit. Idempotent.
     pub fn stop(&mut self) {
         self.stop_token.cancel();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        // The server is gone; detached handles make later writes answer
+        // BadOutOfService instead of queueing into an orphaned runtime.
+        self.write_state.detach_runtimes();
     }
 }
 
@@ -506,6 +558,7 @@ mod tests {
             application_uri: "urn:datafactory:runtime".into(),
             namespace_uri: "urn:datafactory:runtime:ns".into(),
             security: Default::default(),
+            write_wait_timeout_ms: None,
         };
         assert!(matches!(
             OpcUaServer::start(&config),
@@ -533,6 +586,7 @@ mod tests {
             application_uri: "urn:datafactory:runtime".into(),
             namespace_uri: "urn:datafactory:runtime:ns".into(),
             security: Default::default(),
+            write_wait_timeout_ms: None,
         };
         let error = match OpcUaServer::start(&config) {
             Err(error) => error,

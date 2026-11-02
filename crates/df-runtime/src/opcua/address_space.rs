@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use df_core::TagDescriptor;
 use opcua::nodes::{AccessLevel, VariableBuilder};
 use opcua::server::address_space::AddressSpace;
-use opcua::server::node_manager::memory::SimpleNodeManager;
+use opcua::server::node_manager::memory::{InMemoryNodeManager, InMemoryNodeManagerImpl};
 use opcua::types::{DataTypeId, NodeId, UAString, Variant};
 
 use super::value::{status_node_identifier, tag_node_identifier, ua_data_type, value_to_variant};
@@ -179,9 +179,11 @@ fn insert_variable(
 }
 
 /// Build the §7.2 address space for the given instance catalogs. `ns` is the
-/// namespace index resolved from the configured `namespace_uri`.
-pub(crate) fn build_address_space(
-    manager: &SimpleNodeManager,
+/// namespace index resolved from the configured `namespace_uri`. Generic over
+/// the in-memory manager's impl so tests can use the stock manager while the
+/// server uses the runtime write handler.
+pub(crate) fn build_address_space<TImpl: InMemoryNodeManagerImpl>(
+    manager: &InMemoryNodeManager<TImpl>,
     namespace_index: u16,
     catalogs: &[InstanceCatalog],
 ) -> Result<AddressSpaceIndex, String> {

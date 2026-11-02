@@ -429,6 +429,97 @@ test result: ok. 2 passed; 0 failed   — df-runtime opcua_publisher 集成测�
 - LastCycleDurationMs 仅断言 ≥0，未校验数值合理性。
 - 环境说明：全部 cargo 命令以 `CARGO_TARGET_DIR=D:\cargo_target_df` 在 D: 盘构建（会话环境变量，未改仓库配置）。
 
+## 2026-11-02：R8 验证（OPC UA Write Handler / 批次聚合 / 确认与取消）
+
+### 1. 形式验证（Windows / rustc 1.99.1 msvc）
+
+```
+命令: cargo fmt --all -- --check
+结果: 通过（无格式差异）
+
+命令: cargo test -p df-runtime --features opcua
+结果: 通过（退出码 0，全套约 62 秒）
+
+test result: ok. 84 passed — df-runtime lib（默认 62 = R7 的 58 + config R8 新增 4；opcua 模块门控 22 = R7 的 14 + write.rs R8 新增 8）
+test result: ok. 2 passed  — df-runtime bin cli 参数解析测试
+test result: ok. 2 passed  — df-runtime host_config 集成测试
+test result: ok. 4 passed  — df-runtime opcua_poc 集成测试
+test result: ok. 2 passed  — df-runtime opcua_publisher 集成测试
+test result: ok. 4 passed  — df-runtime opcua_write 集成测试（R8 新增）
+小计: 98 passed / 0 failed
+
+命令: cargo test --workspace（默认构建，无 opcua feature）
+结果: 通过（退出码 0，无警告）
+19（df-core）+ 3（rust_sdk）+ 62（df-runtime lib）+ 2（host_config）+ 2（cli）+ 3（df-sdk）= 91 passed / 0 failed
+
+命令: cargo tree -p df-runtime；cargo tree -p df-runtime --features opcua
+结果: 默认树无 async-opcua/tokio（零 OPC UA 依赖）；feature 树 async-opcua/tokio/async-trait 全部出现（§9.2 复验通过）
+```
+
+### 2. 写处理器实现要点（opcua/write.rs，8 个单元测试）
+
+- 自定义 NodeManager：`pub type RuntimeNodeManager = InMemoryNodeManager<RuntimeNodeManagerImpl>`——只覆盖 `write`，init/browse/读路径继承 async-opcua 内置 InMemoryNodeManager；`RuntimeNodeManagerImpl` 与 `runtime_node_manager()` 公开供宿主复用。发布器与写处理器共用同一 `AddressSpaceIndex`，NodeId ↔ Tag 目录一一对应。
+- `WriteHandlerState` 持有每实例 Tag 条目（字符串标识 → writable/DataType + RuntimeHandle）并实现 §8.4 状态映射（所有拒绝不入队）：
+  - 未知节点 / 非字符串 NodeId 标识 → `BadNodeIdUnknown`（WR-04）
+  - host-owned：实例与服务器 Status 节点、非 Value 属性 → `BadNotWritable`
+  - index_range ≠ None → `BadIndexRangeInvalid`（Tag 模型无数组语义）
+  - DataValue 无 value → `BadNothingToDo`
+  - writable=false → `BadNotWritable`（WR-02，先于角色判定——只读语义与权限语义分离）
+  - 身份角色 ≠ Writer（匿名视为 Reader）→ `BadUserAccessDenied`（SEC-04）
+  - Variant 与目录 DataType 严格匹配（FLOAT64↔Double / INT64↔Int64 / BOOL↔Boolean / STRING↔String，不转换）→ 否则 `BadTypeMismatch`（WR-03）
+  - 校验全部通过 → 整批 `submit_writes` 入队，按周期边界回执回答（WR-01）；批次内任一节点被拒 → 整批不入队，有效节点答 `BadNothingToDo`（WR-05 原子性）
+  - 实例无挂接 handle → `BadOutOfService`；队列满 → `BadServerTooBusy` 不入队（WR-06）；等待回执超时 → `BadTimeout`（§8.5.4 结果不定，批次不撤销）
+- 等待时长：`derive_write_wait` = 2×cycle_time + 2 s 余量，夹取 [2 s, 30 s]；`opcua.write_wait_timeout_ms` 配置覆盖优先（`write_wait_derives_from_cycle_time_and_clamps` / `wait_override_takes_precedence` 两个专项测试）。
+
+### 3. 集成测试覆盖点（tests/opcua_write.rs，4 个合并场景）
+
+环境：真实 two-tank engine + SignAndEncrypt/Basic256Sha256 服务端（配置用户 engineer=Writer、viewer=Reader，密码经环境变量注入，配置文件不含明文）+ 每场景独立证书目录（服务端样例密钥对 + 客户端样例密钥对 + `trust_server_certs(true)`）+ 用户名口令激活会话。
+
+- `rejection_matrix_enforces_catalog_identity_and_atomicity`：WR-02 只读 tank_1.level → BadNotWritable；WR-03 String/Int64 写 FLOAT64 → BadTypeMismatch；index-range → BadIndexRangeInvalid；缺 value → BadNothingToDo；WR-04 未知节点 → BadNodeIdUnknown；WR-05 有效+无效混合批次 → 有效节点 BadNothingToDo、无效节点 BadNotWritable，且后续落点精确证明有效值未部分应用；SEC-04 viewer 写可写 Tag → BadUserAccessDenied；CycleIndex 状态节点写 → BadNotWritable。
+- `writer_writes_apply_in_order_at_cycle_boundaries`：WR-01 写入 Good 且在引擎应用后经发布链回读 0.002（WR-07：引擎应用 → 快照 → 地址空间 → 客户端读）；模型闭环响应——tank_1.level 自初始 0.15 上升；WR-08 第二批 0.003 在第一批之后生效。
+- `queue_full_rejects_and_timed_out_writes_still_apply`：capacity=1 + 500 ms 覆盖等待 + 2 s 周期（`wait_for_cycle_start` 同步到周期起点）：首批入队 → BadTimeout 但批次保留；第二批 → BadServerTooBusy 即时拒绝；queue_depth 保持 1；最终经发布链回读 0.002——§8.5.4 "超时 ≠ 未生效" 实证。
+- `stopped_instances_reject_writes_and_pending_batches_are_discarded`：10 s 周期 + 300 ms 覆盖：提交 → BadTimeout；`runtime.stop()` 后快照仍为初值 0.0012（WR-09 待处理批次丢弃不应用）；后续写入 → BadOutOfService。
+
+### 4. CLI 接线与 e2e（Windows 真实二进制 df-runtime.exe，4 条路径）
+
+- check 预检（CFG-01 扩展）：`df-runtime check --config` 现在解析 users 的密码环境变量——未设置时退出 2 并指名变量名（实测 `DF_E2E_PW`）；设置后退出 0。
+- 退出 4：run --config 下 OPC UA 端口被占 → 绑定失败在启动阶段同步报告（"opcua server failed to start: cannot bind ..."）→ shutdown 已启动实例 → 退出 4（R5 遗留未验证项闭环）。
+- 退出 0：完整 host 路径——"opcua serving at" + 实例 Running + `status`/`stop` 控制台正常，优雅停止退出 0；二进制未启用 opcua feature 而 opcua.enabled=true 时打印提示不启动。
+- 退出 5（首次真实触发）：致命工程为 DSL `type: Expression, formula: sqrt(base)`、`base: -1.0` → 首周期 sqrt(-1)=NaN → `eval_expression` 的 is_finite 检查拒绝 → 实例 Failed。`Runtime::start` 不同步跑首周期，故 start_all 返回 Running、崩溃发生在控制台循环内 → 检测到原 Running 实例 Failed → shutdown → 退出 5。致命工程（可复现）：
+
+```yaml
+dsl_version: 2
+metadata: {name: fatal_expr, description: e2e fatal}
+clock: {mode: GENERATOR, cycle_time: 0.2}
+program:
+  - name: base
+    type: Variable
+    value: -1.0
+    writable: false
+    display_args: []
+  - name: boom
+    type: Expression
+    formula: sqrt(base)
+    display_args: []
+export: {default_columns: [boom]}
+```
+
+- e2e 脚本（PowerShell，延迟写 stdin 以赢得首周期竞态）为会话临时工件不入库；上述命令与结果均已内联记录，可按本节复现。
+
+### 5. 测试规模控制记录（响应"测试过慢"反馈）
+
+- 背景：初版 11 个单场景集成测试出现 ~15 分钟超时与挂起。定位出两个根因：① 每个测试独立生成 RSA 密钥对 + 全套启动，开销叠加；② 夹具 scratch 目录同名互删（`two_tank_with_cycle_time` 与 `start_fixture` 同名调用时 `remove_dir_all` 删除了工程文件，3 个测试连锁失败）。
+- 处置：11 → 4 个合并场景；工程 YAML 写入独立 `*_project` 目录；`wait_for_cycle_start` 以 cycle_index 同步消除写提交跨越周期边界的竞态；`wait_for_connection` 以 15 s 超时包裹（客户端必须 `trust_server_certs(true)`，否则激活静默挂起——poc 已验证结论的再次确认）。曾尝试进程级共享密钥对路径，出现会话激活挂起，按"不引入未验证捷径"原则回退到 poc 验证过的每夹具独立证书模式。
+- 结果：opcua_write 4/4 约 22–37 s，全 opcua 测试面 ~62 s，退出码 0。
+
+### 6. 边界说明（未验证项）
+
+- `BadOutOfService` 独立判定仅 Writer over SignAndEncrypt 可达（匿名/Reader 在 SEC-04 先被拒），由 write.rs 单元测试覆盖，未做独立客户端场景。
+- 取消路径（§8.5.3 仅 Queued 可取消）：OPC UA 标准 Write 服务无取消语义，写处理器未暴露取消入口；`WriteTicket::cancel` 的 Queued-only 取消语义由 R1 单元测试覆盖。
+- UA-02（独立客户端 Browse Instances/Tags 层级）与客户端侧完整 UA-05 类型矩阵验证归 R9 闭环测试。
+- Starting 窗口 BadWaitingForInitialData、ServerStatus State 聚合等遗留边界沿用 R7 记录。
+- 环境说明：全部 cargo 命令以 `CARGO_TARGET_DIR=D:\cargo_target_df` 在 D: 盘构建（会话环境变量，未改仓库配置）。
+
 
 
 

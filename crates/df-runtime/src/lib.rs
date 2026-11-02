@@ -23,8 +23,8 @@ mod runtime_handle;
 pub mod opcua;
 
 pub use config::{
-    HostConfig, InstanceConfig, OpcUaConfig, OpcUaSecurityConfig, SchedulerConfig, SecurityMode,
-    SecurityPolicy,
+    resolve_user_credentials, HostConfig, InstanceConfig, OpcUaConfig, OpcUaSecurityConfig,
+    PlainUserCredentials, SchedulerConfig, SecurityMode, SecurityPolicy,
 };
 pub use instance::{InstanceState, InstanceSummary};
 pub use loader::load_engine;

@@ -21,7 +21,9 @@ use std::time::{Duration, Instant};
 
 use df_core::{TagDescriptor, Value};
 use df_runtime::load_engine;
-use df_runtime::opcua::{tag_node_identifier, InstanceCatalog, OpcUaServer, PlainUserCredentials};
+use df_runtime::opcua::{
+    tag_node_identifier, InstanceCatalog, OpcUaServer, OpcUaUserConfig, UserRole,
+};
 use opcua::client::{ClientBuilder, DataChangeCallback, IdentityToken, Password};
 use opcua::crypto::SecurityPolicy as UaSecurityPolicy;
 use opcua::types::{
@@ -54,6 +56,7 @@ fn loopback_none_config(port: u16) -> df_runtime::OpcUaConfig {
         application_uri: "urn:datafactory:runtime".into(),
         namespace_uri: "urn:datafactory:runtime:ns".into(),
         security: df_runtime::OpcUaSecurityConfig::default(),
+        write_wait_timeout_ms: None,
     }
 }
 
@@ -197,7 +200,7 @@ async fn catalog_address_space_reads_writes_and_subscriptions() {
     let port = free_port();
     let config = loopback_none_config(port);
     let catalogs = vec![two_tank_catalog("tank-a"), two_tank_catalog("tank-b")];
-    let mut server = OpcUaServer::start_with_catalogs(&config, &catalogs, &[]).unwrap();
+    let mut server = OpcUaServer::start_with_catalogs(&config, &catalogs).unwrap();
     assert_eq!(server.endpoint_url(), config.endpoint_url);
     assert!(server.namespace_index() >= 1);
 
@@ -315,8 +318,10 @@ async fn catalog_address_space_reads_writes_and_subscriptions() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // Writable tag: the write is stored and served back (WR-01 value path;
-    // Engine round-trip arrives with R8).
+    // Write path (R8 semantics, anonymous client): the anonymous identity is
+    // a Reader, so even the writable tag rejects with BadUserAccessDenied
+    // (SEC-04); values are served by the publisher, never stored by the
+    // write handler.
     let inlet = index.tag("tank-a", "plant_inlet_flow").unwrap().clone();
     assert!(inlet.writable);
     let results = session
@@ -329,17 +334,13 @@ async fn catalog_address_space_reads_writes_and_subscriptions() {
         .await
         .unwrap();
     assert!(
-        results[0].is_good(),
-        "writable write result {:?}",
+        results[0] == opcua::types::StatusCode::BadUserAccessDenied,
+        "an anonymous write must be BadUserAccessDenied, got {:?}",
         results[0]
     );
-    assert!(
-        wait_for_double(&session, &inlet.node_id, 0.002, Duration::from_secs(5)).await,
-        "writable tag must read back 0.002 after the client write"
-    );
 
-    // Read-only tag: writes are rejected (WR-02; the library reports
-    // BadUserAccessDenied via the AccessLevel bits).
+    // Read-only tag: rejected from the catalog, not the AccessLevel bits
+    // (WR-02; BadNotWritable per the §8.4 mapping).
     let results = session
         .write(&[WriteValue {
             node_id: level_a.node_id.clone(),
@@ -350,8 +351,24 @@ async fn catalog_address_space_reads_writes_and_subscriptions() {
         .await
         .unwrap();
     assert!(
-        results[0] == opcua::types::StatusCode::BadUserAccessDenied,
-        "read-only write must be rejected, got {:?}",
+        results[0] == opcua::types::StatusCode::BadNotWritable,
+        "read-only write must be BadNotWritable, got {:?}",
+        results[0]
+    );
+
+    // Unknown node (WR-04).
+    let results = session
+        .write(&[WriteValue {
+            node_id: NodeId::new(server.namespace_index(), "df/instances/tank-a/tags/nothing"),
+            attribute_id: AttributeId::Value as u32,
+            index_range: NumericRange::None,
+            value: DataValue::new_now(1.0f64),
+        }])
+        .await
+        .unwrap();
+    assert!(
+        results[0] == opcua::types::StatusCode::BadNodeIdUnknown,
+        "unknown node write must be BadNodeIdUnknown, got {:?}",
         results[0]
     );
 
@@ -370,7 +387,7 @@ async fn node_ids_are_stable_across_restarts() {
     let config = loopback_none_config(port);
     let catalogs = vec![two_tank_catalog("tank-a")];
 
-    let mut server = OpcUaServer::start_with_catalogs(&config, &catalogs, &[]).unwrap();
+    let mut server = OpcUaServer::start_with_catalogs(&config, &catalogs).unwrap();
     let first = server.address_space().clone();
     let first_ids: Vec<NodeId> = ["tank_1.level", "tank_2.level", "plant_inlet_flow"]
         .iter()
@@ -382,7 +399,7 @@ async fn node_ids_are_stable_across_restarts() {
         .collect();
     server.stop();
 
-    let mut server = OpcUaServer::start_with_catalogs(&config, &catalogs, &[]).unwrap();
+    let mut server = OpcUaServer::start_with_catalogs(&config, &catalogs).unwrap();
     let second = server.address_space().clone();
     for (name, expected) in ["tank_1.level", "tank_2.level", "plant_inlet_flow"]
         .iter()
@@ -419,7 +436,7 @@ async fn tag_metadata_description_and_unit_property() {
             initial: Value::Float(1.0),
         }],
     };
-    let mut server = OpcUaServer::start_with_catalogs(&config, &[catalog], &[]).unwrap();
+    let mut server = OpcUaServer::start_with_catalogs(&config, &[catalog]).unwrap();
 
     let session = connect_anonymous("meta_session", &config.endpoint_url).await;
     assert!(session.wait_for_connection().await);
@@ -470,6 +487,9 @@ async fn secure_channel_with_username_password_auth() {
     std::fs::create_dir_all(&trust_dir).unwrap();
 
     let port = free_port();
+    // Unique environment variable so parallel test processes cannot collide.
+    let password_env = format!("DF_POC_SECURE_PW_{}", std::process::id());
+    std::env::set_var(&password_env, "s3cret");
     let config = df_runtime::OpcUaConfig {
         enabled: true,
         endpoint_url: format!("opc.tcp://127.0.0.1:{port}"),
@@ -482,14 +502,18 @@ async fn secure_channel_with_username_password_auth() {
             server_certificate: Some(cert_dir.join("server.der")),
             server_private_key: Some(cert_dir.join("server-key.pem")),
             trust_list: Some(trust_dir),
+            // The engineer is a Writer: the R8 write tests authenticate as
+            // this user (§9.1: username/password only over SignAndEncrypt).
+            users: vec![OpcUaUserConfig {
+                username: "engineer".into(),
+                password_env: password_env.clone(),
+                role: UserRole::Writer,
+            }],
         },
+        write_wait_timeout_ms: None,
     };
-    let users = vec![PlainUserCredentials {
-        username: "engineer".into(),
-        password: "s3cret".into(),
-    }];
     let catalogs = vec![two_tank_catalog("tank-a")];
-    let mut server = OpcUaServer::start_with_catalogs(&config, &catalogs, &users).unwrap();
+    let mut server = OpcUaServer::start_with_catalogs(&config, &catalogs).unwrap();
 
     // Sample keypairs were generated at the configured paths.
     assert!(
@@ -523,6 +547,29 @@ async fn secure_channel_with_username_password_auth() {
     assert!(
         wait_for_double(&session, &level.node_id, 0.15, Duration::from_secs(5)).await,
         "tank level must read 0.15 over the encrypted channel"
+    );
+
+    // Writer identity, standalone server (no runtime attached): the writable
+    // tag answers BadOutOfService because no engine can take the write
+    // (§8.4 stopped instance; full closed-loop writes arrive with R8 tests).
+    let inlet = server
+        .address_space()
+        .tag("tank-a", "plant_inlet_flow")
+        .unwrap()
+        .clone();
+    let results = session
+        .write(&[WriteValue {
+            node_id: inlet.node_id.clone(),
+            attribute_id: AttributeId::Value as u32,
+            index_range: NumericRange::None,
+            value: DataValue::new_now(0.002f64),
+        }])
+        .await
+        .unwrap();
+    assert!(
+        results[0] == opcua::types::StatusCode::BadOutOfService,
+        "a Writer write without an attached runtime must be BadOutOfService, got {:?}",
+        results[0]
     );
     session.disconnect().await.unwrap();
 

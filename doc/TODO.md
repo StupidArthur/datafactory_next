@@ -414,6 +414,22 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
 - [~] 边界：UA-02 Browse 与完整 UA-05 客户端矩阵归 R9；Starting 窗口的 BadWaitingForInitialData 未做客户端验证（仅单元测试覆盖映射，集成测试在 Running 后接入）；ServerStatus State 聚合语义较简单（按优先级聚合，与 §7.2 设计一致）；停机瞬间对订阅推送最终 BadOutOfService 通知未显式断言（验证的是读路径）。
 - 证据：`doc/engineering/verification-log.md#2026-11-02-r7-验证`。
 
+### 2026-11-02：R8 验证（OPC UA Write Handler / 批次聚合 / 确认与取消）
+
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test -p df-runtime --features opcua` 通过：98 个测试全部通过、0 失败（df-runtime lib 84 = 默认 62（R8 config 新增 4）+ opcua 模块门控 22（R8 write.rs 新增 8）、bin cli 2、host_config 2、opcua_poc 4、opcua_publisher 2、opcua_write 4）；全套约 62 秒。
+- [x] `cargo test --workspace`（默认构建）通过：91 个测试全部通过、0 失败、0 警告（df-core 19 + rust_sdk 3 + df-runtime lib 62 + host_config 2 + cli 2 + df-sdk 3）。
+- [x] 依赖隔离复验（§9.2）：`cargo tree -p df-runtime`（默认）无 async-opcua/tokio；`--features opcua` 时全部出现。
+- [x] `opcua/write.rs`（§8.3/§8.4，8 个单元测试）：自定义 NodeManager `InMemoryNodeManager<RuntimeNodeManagerImpl>` 只覆盖 `write`，其余读写仍走内置节点管理器；§8.4 状态映射逐项：未知/非字符串 NodeId → BadNodeIdUnknown、host-owned（Status 节点与非 Value 属性）→ BadNotWritable、index_range → BadIndexRangeInvalid、缺 value → BadNothingToDo、writable=false → BadNotWritable（先于角色判定）、角色非 Writer → BadUserAccessDenied、类型不匹配 → BadTypeMismatch（严格匹配不转换）；等待时长按 2×cycle_time + 2 s 余量推导并夹取 [2 s, 30 s]，`write_wait_timeout_ms` 覆盖优先。
+- [x] 用户/角色配置（config.rs 新增 4 个测试 + opcua/mod.rs 接线）：users 块解析与角色默认值、用户定义校验、密码环境变量在服务启动时解析（`resolve_user_credentials`）、write_wait_timeout_ms 边界校验；服务端按 allow_anonymous 决定是否公告匿名令牌策略。
+- [x] 集成测试（tests/opcua_write.rs，4 个合并场景，真实 engine + SignAndEncrypt + 用户名口令 + 独立客户端）：① 拒绝矩阵（WR-02 只读 BadNotWritable、WR-03 String/Int64→FLOAT64 BadTypeMismatch、index-range BadIndexRangeInvalid、缺 value BadNothingToDo、WR-04 未知节点 BadNodeIdUnknown、WR-05 整批原子性——有效节点 BadNothingToDo 且后续落点证明未部分应用、SEC-04 Reader 写 BadUserAccessDenied、Status 节点 BadNotWritable）；② WR-01/07/08 写入经引擎在周期边界生效 → 发布链回读 → 模型闭环响应（液位上升）→ 第二批顺序生效；③ WR-06 队列满即时 BadServerTooBusy 且队列批次保留 + §8.5.4 超时返回 BadTimeout 但批次下一周期仍生效；④ WR-09 停止实例后写入 BadOutOfService 且待处理批次不应用（快照保持初值）。
+- [x] 测试规模控制（响应测试过慢反馈）：11 个单场景测试合并为 4 个场景测试；修复夹具 scratch 目录同名互删缺陷（慢周期工程 YAML 写入独立 `*_project` 目录）；`wait_for_cycle_start` 以 cycle_index 同步消除写提交跨越周期边界的竞态；`wait_for_connection` 以 15 s 超时包裹避免激活挂起；全 opcua 测试面稳定在 ~62 s。
+- [x] CLI 接线与 Windows e2e（真实二进制，4 条路径全部验证）：check CFG-01 预检密码环境变量（未设 → 退出 2 并指名变量名；已设 → 退出 0）；run --config OPC UA 端口占用 → 绑定失败同步报告并 shutdown 实例 → 退出 4（R5 遗留未验证项闭环）；完整 host 路径（"opcua serving at" + 实例 Running + status/stop 控制台）退出 0；sqrt(-1) Expression 工程 → 引擎首周期致命错误 → 实例 Failed → Host 退出 5（退出码 5 首次真实触发闭环）；opcua.enabled=true 但二进制未启用 opcua feature 时打印提示；中途失败检测（实例 Failed / 服务停止）在控制台循环内执行统一 shutdown 后退出。
+- [x] poc 测试同步（opcua_poc 4 个）：匿名身份为 Reader → 可写 Tag 写入 BadUserAccessDenied（SEC-04 先于独立 writable 判定）、只读 Tag BadNotWritable、未知节点 BadNodeIdUnknown（R6 时代由库 AccessLevel 拦截的语义换成 §8.4 目录语义断言）；安全 PoC 注册 Writer 用户。
+- [x] 设计文档同步：§4.1 配置示例补 users 块与 write_wait_timeout_ms、§8.2 补写处理链路实现形态、§8.5 补等待推导与覆盖键说明；§12.2 退出码表与实现核对一致（无需改动）。
+- [~] 边界：BadOutOfService 独立判定仅 Writer over SignAndEncrypt 可达（匿名/Reader 在 SEC-04 先被拒），由 write.rs 单元测试覆盖；取消路径（§8.5.3）——OPC UA 标准 Write 无取消语义，处理器未暴露取消入口，`WriteTicket::cancel` 的 Queued-only 取消语义由 R1 单元测试覆盖；UA-02 Browse 层级与客户端侧完整 UA-05 矩阵归 R9。
+- 证据：`doc/engineering/verification-log.md#2026-11-02-r8-验证`。
+
 
 ## 13. Runtime 系统设计基线
 
@@ -427,7 +443,7 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
   - [x] R5 OPC UA 库 PoC、Endpoint 与安全配置。（2026-11-02，见 §12 R5 验证记录）
   - [x] R6 Tag Catalog → NodeId/Variant/AccessLevel 映射。（2026-11-02，见 §12 R6 验证记录）
   - [x] R7 Snapshot 周期发布与订阅通知。（2026-11-02，见 §12 R7 验证记录；含 R1 停机协议顺序修复）
-  - [ ] R8 OPC UA Write Handler、批次聚合、确认与取消。
+  - [x] R8 OPC UA Write Handler、批次聚合、确认与取消。（2026-11-02，见 §12 R8 验证记录；含 CLI 退出码 4/5 接线与首次真实触发）
   - [ ] R9 双水箱闭环案例与独立客户端自动化测试。
   - [ ] R10 Monitor 指标、报警、归档。
 

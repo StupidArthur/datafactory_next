@@ -573,6 +573,7 @@ name = "df-runtime"
 version = "0.1.0"
 dependencies = [
  "async-opcua",
+ "async-trait",
  "df-core",
  "serde",
  "serde_yaml",

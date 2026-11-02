@@ -187,6 +187,16 @@ opcua:
     server_certificate: "./cert/server.der"
     server_private_key: "./cert/server-key.pem"
     trust_list: "./cert/trusted"
+    users:
+      - username: engineer
+        password_env: DF_RUNTIME_ENGINEER_PW
+        role: writer
+      - username: viewer
+        password_env: DF_RUNTIME_VIEWER_PW
+        role: reader
+  # 可选：写入等待上限（毫秒）。缺省按实例周期推导：
+  # 2×cycle_time + 2 s 余量，并夹取到 [2 s, 30 s]（§8.5）。
+  # write_wait_timeout_ms: 5000
 
 instances:
   - id: tank-a
@@ -211,6 +221,8 @@ instances:
 - 相同项目文件可以启动多次；每次加载都创建新的 Engine，初始值和内部状态彼此独立。
 - `id` 是 Runtime 实例唯一标识，建议限制为 1–64 位字母、数字、下划线和连字符，区分大小写。
 - `write_queue_capacity` 是写入批次数量上限，不是 Tag 数量上限。
+- `security.users` 声明可登录的 OPC UA 用户及其角色（§9.1）。配置中只保存 `password_env`——密码所在环境变量的名字，密码本身在服务启动时解析；`check` 命令会预检这些环境变量是否已设置。
+- `write_wait_timeout_ms` 覆盖写入等待上限的自动推导（§8.5）。
 - 默认 `overrun_policy` 为 `delay`。未配置的实例参数使用统一默认值。
 - 配置结构应使用严格反序列化，未知字段、重复实例 ID、无效路径和非法端点必须在启动前报告。
 
@@ -550,6 +562,8 @@ sequenceDiagram
     UA-->>Client: Good
 ```
 
+实现上，写处理链路通过自定义 NodeManager 承载：`InMemoryNodeManager<RuntimeNodeManagerImpl>` 只覆盖 `write`，其余读写仍走 async-opcua 内置节点管理器。发布器（SnapshotPublisher）与写处理器共用同一 `AddressSpaceIndex`，保证节点标识与 Tag 目录一一对应。
+
 ### 8.3 写入批次规则
 
 - 同一 OPC UA Write 服务请求中，属于同一个实例的多个 Tag 写入合并为一个 Runtime 写入批次。
@@ -580,7 +594,7 @@ sequenceDiagram
 
 OPC UA Adapter 实现时必须处理这个边界：
 
-1. 写服务端等待 WriteTicket 的时间应覆盖一个完整 cycle_time、周期计算时间和合理通信余量。
+1. 写服务端等待 WriteTicket 的时间应覆盖一个完整 cycle_time、周期计算时间和合理通信余量。当前实现按实例周期自动推导：2×cycle_time + 2 s 余量，并夹取到 [2 s, 30 s]；Host 配置可用 `opcua.write_wait_timeout_ms` 覆盖该推导（§4.1）。
 2. 适配层应增加写入请求 ID 和可查询的写入状态，至少区分 Queued、Applying、Applied、Rejected、Cancelled。
 3. 若客户端请求取消，只有尚未开始应用的 Queued 批次才允许取消；进入 Applying 后不能承诺撤销。
 4. 如果请求超时发生在 Applying 阶段，记录为结果不确定，并允许通过诊断接口查询最终结果；不得声称一定未生效。

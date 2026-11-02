@@ -39,6 +39,7 @@ fn loopback_none_config(port: u16) -> df_runtime::OpcUaConfig {
         application_uri: "urn:datafactory:runtime".into(),
         namespace_uri: "urn:datafactory:runtime:ns".into(),
         security: df_runtime::OpcUaSecurityConfig::default(),
+        write_wait_timeout_ms: None,
     }
 }
 
@@ -164,7 +165,7 @@ async fn publisher_streams_cycles_status_and_marks_out_of_service_on_stop() {
     let port = free_port();
     let config = loopback_none_config(port);
     let (project, catalogs) = two_tank();
-    let mut server = OpcUaServer::start_with_catalogs(&config, &catalogs, &[]).unwrap();
+    let mut server = OpcUaServer::start_with_catalogs(&config, &catalogs).unwrap();
 
     let engine = load_engine(&project).unwrap();
     let mut runtime = Runtime::start(engine).unwrap();
@@ -310,7 +311,7 @@ async fn publisher_rejects_unknown_and_duplicate_instances() {
     let port = free_port();
     let config = loopback_none_config(port);
     let (_, catalogs) = two_tank();
-    let mut server = OpcUaServer::start_with_catalogs(&config, &catalogs, &[]).unwrap();
+    let mut server = OpcUaServer::start_with_catalogs(&config, &catalogs).unwrap();
 
     let project = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../examples/two-tank/two-tank.dfproject");

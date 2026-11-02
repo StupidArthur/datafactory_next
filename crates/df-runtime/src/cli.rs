@@ -10,13 +10,16 @@
 //! | `df-runtime version` | 输出 Runtime、Project Format 与 Engine ABI 版本 |
 //!
 //! Exit codes (§12.2): 0 正常停止；1 未分类错误；2 参数或配置错误；
-//! 3 项目编译/加载失败；5 Host 运行中不可恢复错误。（4 预留给 OPC UA。）
+//! 3 项目编译/加载失败；4 OPC UA 启动失败；5 Host 运行中不可恢复错误。
 
 use std::io::{self, BufRead};
 use std::path::Path;
 
 use df_core::{ENGINE_ABI_VERSION, PROJECT_FORMAT_VERSION};
 use df_runtime::{HostConfig, Runtime, RuntimeManager, RuntimeState};
+
+#[cfg(feature = "opcua")]
+use df_runtime::opcua::{InstanceCatalog, OpcUaServer, SnapshotPublisher};
 
 /// Non-zero exit outcomes mapped onto §12.2.
 pub struct Failure {
@@ -35,6 +38,15 @@ impl Failure {
     fn project_error(message: impl Into<String>) -> Self {
         Self {
             code: 3,
+            message: message.into(),
+        }
+    }
+
+    /// OPC UA serving could not be started (§12.2).
+    #[cfg(feature = "opcua")]
+    fn opcua_error(message: impl Into<String>) -> Self {
+        Self {
+            code: 4,
             message: message.into(),
         }
     }
@@ -172,10 +184,19 @@ fn check_config(config_path: &str) -> Result<(), Failure> {
 
     println!("host config ok: {config_path}");
     match &config.opcua {
-        Some(opcua) => println!(
-            "opcua: enabled={} endpoint={}",
-            opcua.enabled, opcua.endpoint_url
-        ),
+        Some(opcua) => {
+            // Resolve the configured users' passwords from the environment
+            // now (§9.1), so `run` cannot fail later on a missing variable.
+            let users = df_runtime::resolve_user_credentials(&opcua.security).map_err(|error| {
+                Failure::args_error(format!("host config check failed: {error}"))
+            })?;
+            println!(
+                "opcua: enabled={} endpoint={} users={}",
+                opcua.enabled,
+                opcua.endpoint_url,
+                users.len()
+            );
+        }
         None => println!("opcua: not configured"),
     }
     println!("instances ({}):", config.instances.len());
@@ -211,20 +232,13 @@ fn check_config(config_path: &str) -> Result<(), Failure> {
     Ok(())
 }
 
-/// Multi-instance host mode (§12.1): start enabled instances and serve the
-/// interactive console until `stop` or end of stdin.
+/// Multi-instance host mode (§12.1): start enabled instances, serve OPC UA
+/// when configured (§9) and run the interactive console until `stop` or end
+/// of stdin.
 fn run_host(config_path: &str) -> Result<(), Failure> {
     let config = HostConfig::load(Path::new(config_path))
         .map_err(|error| Failure::args_error(format!("host config error: {error}")))?;
     let manager = RuntimeManager::from_config(config.clone());
-
-    if let Some(opcua) = &config.opcua {
-        if opcua.enabled {
-            eprintln!(
-                "note: opcua.enabled=true, but OPC UA serving is not implemented yet (R5); starting instances only"
-            );
-        }
-    }
 
     println!("starting runtime host: {config_path}");
     let failures = manager.start_all();
@@ -241,6 +255,36 @@ fn run_host(config_path: &str) -> Result<(), Failure> {
         return Err(Failure::project_error(
             "all enabled instances failed to start",
         ));
+    }
+
+    // Ids that were running when the host came up: if one of these hits a
+    // fatal error later, the host stops with exit 5 (§12.2). Instances that
+    // failed to start above are already reported and do not re-trigger.
+    let started: Vec<String> = manager
+        .list_instances()
+        .into_iter()
+        .filter(|summary| summary.enabled && summary.state == df_runtime::InstanceState::Running)
+        .map(|summary| summary.id)
+        .collect();
+
+    // OPC UA serving (§9): the address space is built from the Tag Catalogs
+    // of the running instances; runtimes are attached for closed-loop writes.
+    #[cfg(feature = "opcua")]
+    let opcua_server = match start_opcua_serving(&config, &manager) {
+        Ok(server) => server,
+        Err(message) => {
+            let stop_failures = manager.shutdown();
+            for (id, error) in &stop_failures {
+                eprintln!("instance {id} failed during shutdown: {error}");
+            }
+            return Err(Failure::opcua_error(message));
+        }
+    };
+    #[cfg(not(feature = "opcua"))]
+    if config.opcua.as_ref().is_some_and(|opcua| opcua.enabled) {
+        eprintln!(
+            "note: opcua.enabled=true, but this binary was built without the opcua feature; serving is disabled"
+        );
     }
 
     for summary in manager.list_instances() {
@@ -261,14 +305,101 @@ fn run_host(config_path: &str) -> Result<(), Failure> {
         if handle_host_command(&manager, line.trim()).is_stop() {
             break;
         }
+        // Mid-run unrecoverable failures stop the host with exit 5 (§12.2).
+        let crashed: Vec<String> = manager
+            .list_instances()
+            .into_iter()
+            .filter(|summary| summary.state == df_runtime::InstanceState::Failed)
+            .filter(|summary| started.contains(&summary.id))
+            .map(|summary| summary.id)
+            .collect();
+        if !crashed.is_empty() {
+            let stop_failures = manager.shutdown();
+            for (id, error) in &stop_failures {
+                eprintln!("instance {id} failed during shutdown: {error}");
+            }
+            return Err(Failure {
+                code: 5,
+                message: format!("instance(s) {crashed:?} failed during operation"),
+            });
+        }
+        #[cfg(feature = "opcua")]
+        if let Some(server) = &opcua_server {
+            if !server.is_running() {
+                let stop_failures = manager.shutdown();
+                for (id, error) in &stop_failures {
+                    eprintln!("instance {id} failed during shutdown: {error}");
+                }
+                return Err(Failure {
+                    code: 5,
+                    message: "the opcua server stopped unexpectedly".into(),
+                });
+            }
+        }
     }
 
+    #[cfg(feature = "opcua")]
+    if let Some(mut server) = opcua_server {
+        server.stop();
+    }
     let stop_failures = manager.shutdown();
     for (id, error) in &stop_failures {
         eprintln!("instance {id} failed during shutdown: {error}");
     }
     println!("runtime host stopped");
     Ok(())
+}
+
+/// Start OPC UA serving for the running instances (§9): one Tag Catalog per
+/// running instance feeds the address space; the runtimes are attached so
+/// writes flow into the engines. Returns `None` when serving is disabled.
+#[cfg(feature = "opcua")]
+fn start_opcua_serving(
+    config: &HostConfig,
+    manager: &RuntimeManager,
+) -> Result<Option<OpcUaServer>, String> {
+    let Some(opcua) = &config.opcua else {
+        return Ok(None);
+    };
+    if !opcua.enabled {
+        return Ok(None);
+    }
+
+    let mut catalogs: Vec<InstanceCatalog> = Vec::new();
+    let mut handles: Vec<(String, df_runtime::RuntimeHandle)> = Vec::new();
+    for summary in manager.list_instances() {
+        if summary.state != df_runtime::InstanceState::Running {
+            continue;
+        }
+        let engine = df_runtime::load_engine(&summary.project).map_err(|error| {
+            format!(
+                "cannot load project {} for the opcua catalog of instance {}: {error}",
+                summary.project.display(),
+                summary.id
+            )
+        })?;
+        catalogs.push(InstanceCatalog {
+            instance_id: summary.id.clone(),
+            tags: engine.catalog().to_vec(),
+        });
+        let handle = manager.get_instance(&summary.id).map_err(|error| {
+            format!("instance {} is unavailable for opcua: {error}", summary.id)
+        })?;
+        handles.push((summary.id.clone(), handle));
+    }
+
+    let mut server = OpcUaServer::start_with_catalogs(opcua, &catalogs)
+        .map_err(|error| format!("opcua server failed to start: {error}"))?;
+    if let Err(error) = server.attach_runtimes(&handles) {
+        server.stop();
+        return Err(format!("opcua runtime attach failed: {error}"));
+    }
+    if let Err(error) = SnapshotPublisher::start(&server, &handles) {
+        server.stop();
+        return Err(format!("opcua snapshot publisher failed to start: {error}"));
+    }
+    println!("opcua serving at {}", server.endpoint_url());
+    Ok(Some(server))
 }
 
 struct Flow(bool);

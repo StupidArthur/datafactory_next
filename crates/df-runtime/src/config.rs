@@ -61,6 +61,11 @@ pub struct OpcUaConfig {
     pub application_uri: String,
     pub namespace_uri: String,
     pub security: OpcUaSecurityConfig,
+    /// Upper bound for how long the OPC UA write handler waits for the
+    /// cycle-boundary confirmation before answering `BadTimeout` (§8.5).
+    /// `None` derives the wait from the instance cycle time
+    /// (2× cycle_time + 2 s margin, clamped to 30 s).
+    pub write_wait_timeout_ms: Option<u64>,
 }
 
 /// OPC UA security settings; paths are absolute after loading.
@@ -72,6 +77,10 @@ pub struct OpcUaSecurityConfig {
     pub server_certificate: Option<PathBuf>,
     pub server_private_key: Option<PathBuf>,
     pub trust_list: Option<PathBuf>,
+    /// Configured users (§9.1). Passwords are never stored here: each entry
+    /// names the environment variable holding the password, resolved when
+    /// the server starts (`resolve_user_credentials`).
+    pub users: Vec<OpcUaUserConfig>,
 }
 
 impl Default for OpcUaSecurityConfig {
@@ -83,8 +92,70 @@ impl Default for OpcUaSecurityConfig {
             server_certificate: None,
             server_private_key: None,
             trust_list: None,
+            users: Vec::new(),
         }
     }
+}
+
+/// OPC UA user role (§9.1): read and write permissions are separated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UserRole {
+    /// May browse, read and subscribe; writes are rejected with
+    /// `BadUserAccessDenied` (SEC-04).
+    Reader,
+    /// Reader plus write access to tags whose catalog entry is writable.
+    Writer,
+}
+
+/// One configured OPC UA user (§9.1). The password itself must not appear in
+/// the Host configuration: `password_env` names the environment variable
+/// holding it and is resolved when the server starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpcUaUserConfig {
+    pub username: String,
+    /// Name of the environment variable holding the user's password.
+    pub password_env: String,
+    pub role: UserRole,
+}
+
+/// Username/password credentials resolved from the environment at server
+/// start. Used by the OPC UA serving layer and by `check` to preflight the
+/// environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainUserCredentials {
+    pub username: String,
+    pub password: String,
+}
+
+/// Resolve the configured users' passwords from the environment (§9.1:
+/// secrets never live in the Host configuration). Fails when a variable is
+/// unset or empty.
+pub fn resolve_user_credentials(
+    security: &OpcUaSecurityConfig,
+) -> Result<Vec<PlainUserCredentials>, RuntimeError> {
+    security
+        .users
+        .iter()
+        .map(|user| {
+            let password = std::env::var(&user.password_env).map_err(|_| {
+                RuntimeError::Config(format!(
+                    "opcua.security.users: environment variable {} for user {} is not set",
+                    user.password_env, user.username
+                ))
+            })?;
+            if password.is_empty() {
+                return Err(RuntimeError::Config(format!(
+                    "opcua.security.users: environment variable {} for user {} is empty",
+                    user.password_env, user.username
+                )));
+            }
+            Ok(PlainUserCredentials {
+                username: user.username.clone(),
+                password,
+            })
+        })
+        .collect()
 }
 
 /// OPC UA message security mode.
@@ -131,6 +202,8 @@ struct RawOpcUaConfig {
     namespace_uri: String,
     #[serde(default)]
     security: RawOpcUaSecurityConfig,
+    #[serde(default)]
+    write_wait_timeout_ms: Option<u64>,
 }
 
 /// Design §9.1: the endpoint defaults to the loopback interface, so an
@@ -154,6 +227,16 @@ struct RawOpcUaSecurityConfig {
     server_private_key: Option<PathBuf>,
     #[serde(default)]
     trust_list: Option<PathBuf>,
+    #[serde(default)]
+    users: Option<Vec<RawOpcUaUserConfig>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOpcUaUserConfig {
+    username: String,
+    password_env: String,
+    role: UserRole,
 }
 
 #[derive(Debug, Deserialize)]
@@ -341,6 +424,7 @@ impl RawOpcUaConfig {
             application_uri: self.application_uri,
             namespace_uri: self.namespace_uri,
             security,
+            write_wait_timeout_ms: self.write_wait_timeout_ms,
         };
         if opcua.enabled {
             validate_opcua_security(&opcua)?;
@@ -383,7 +467,70 @@ pub(crate) fn validate_opcua_security(config: &OpcUaConfig) -> Result<(), Runtim
             ));
         }
     }
+
+    // User definitions (§9.1): usernames are strict, secrets come from the
+    // environment, and username/password is refused on unsecured channels
+    // because OPC UA sends user credentials as plaintext without one.
+    let mut seen = BTreeSet::new();
+    for user in &config.security.users {
+        if !is_valid_username(&user.username) {
+            return Err(RuntimeError::Config(format!(
+                "opcua.security.users: username {:?} is invalid: use 1-64 ASCII letters, digits or one of '_' '-' '.' '@'",
+                user.username
+            )));
+        }
+        if !seen.insert(user.username.as_str()) {
+            return Err(RuntimeError::Config(format!(
+                "opcua.security.users: duplicate username {:?}",
+                user.username
+            )));
+        }
+        if user.password_env.trim().is_empty() {
+            return Err(RuntimeError::Config(format!(
+                "opcua.security.users: user {:?} needs a password_env naming the environment variable that holds the password",
+                user.username
+            )));
+        }
+    }
+    if !config.security.users.is_empty()
+        && (config.security.mode == SecurityMode::None
+            || config.security.policy == SecurityPolicy::None)
+    {
+        return Err(RuntimeError::Config(
+            "opcua.security.users: username/password authentication requires security.mode and security.policy other than None; user credentials are sent as plaintext otherwise"
+                .into(),
+        ));
+    }
+    if !config.security.allow_anonymous && config.security.users.is_empty() {
+        return Err(RuntimeError::Config(
+            "opcua.security: the endpoint would accept no identity: enable allow_anonymous or configure security.users"
+                .into(),
+        ));
+    }
+
+    // Write-response wait (§8.5): optional override must be a sane duration.
+    if let Some(0) = config.write_wait_timeout_ms {
+        return Err(RuntimeError::Config(
+            "opcua.write_wait_timeout_ms must be greater than 0".into(),
+        ));
+    }
+    if config.write_wait_timeout_ms.is_some_and(|ms| ms > 300_000) {
+        return Err(RuntimeError::Config(
+            "opcua.write_wait_timeout_ms must not exceed 300000 (5 minutes)".into(),
+        ));
+    }
     Ok(())
+}
+
+/// Usernames: 1-64 ASCII letters, digits or one of `_` `-` `.` `@`. The
+/// anonymous token id is reserved.
+fn is_valid_username(username: &str) -> bool {
+    !username.is_empty()
+        && !username.eq_ignore_ascii_case("anonymous")
+        && username.len() <= 64
+        && username
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '@'))
 }
 
 impl RawOpcUaSecurityConfig {
@@ -427,6 +574,16 @@ impl RawOpcUaSecurityConfig {
             server_certificate,
             server_private_key,
             trust_list,
+            users: self
+                .users
+                .unwrap_or_default()
+                .into_iter()
+                .map(|user| OpcUaUserConfig {
+                    username: user.username,
+                    password_env: user.password_env,
+                    role: user.role,
+                })
+                .collect(),
         })
     }
 }
@@ -797,7 +954,7 @@ mod tests {
     fn opcua_cert_paths_resolve_against_config_dir() {
         let root = setup(
             "opcua_certs",
-            "runtime_version: 1\nopcua:\n  enabled: true\n  endpoint_url: \"opc.tcp://127.0.0.1:4840\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime:ns\"\n  security:\n    mode: SignAndEncrypt\n    policy: Basic256Sha256\n    allow_anonymous: false\n    server_certificate: ./cert/server.der\n    server_private_key: ./cert/server-key.pem\n    trust_list: ./cert/trusted\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n",
+            "runtime_version: 1\nopcua:\n  enabled: true\n  endpoint_url: \"opc.tcp://127.0.0.1:4840\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime:ns\"\n  security:\n    mode: SignAndEncrypt\n    policy: Basic256Sha256\n    allow_anonymous: false\n    server_certificate: ./cert/server.der\n    server_private_key: ./cert/server-key.pem\n    trust_list: ./cert/trusted\n    users:\n      - username: engineer\n        password_env: DF_TEST_PW_1\n        role: writer\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n",
         );
         fs::create_dir_all(root.join("cert")).unwrap();
         fs::write(root.join("cert/server.der"), b"cert").unwrap();
@@ -909,7 +1066,7 @@ mod tests {
     fn non_loopback_secure_non_anonymous_endpoint_is_accepted() {
         let root = setup(
             "opcua_secure_remote",
-            "runtime_version: 1\nopcua:\n  enabled: true\n  endpoint_url: \"opc.tcp://192.168.1.10:4840\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime:ns\"\n  security:\n    mode: SignAndEncrypt\n    policy: Basic256Sha256\n    allow_anonymous: false\n    server_certificate: ./cert/server.der\n    server_private_key: ./cert/server-key.pem\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n",
+            "runtime_version: 1\nopcua:\n  enabled: true\n  endpoint_url: \"opc.tcp://192.168.1.10:4840\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime:ns\"\n  security:\n    mode: SignAndEncrypt\n    policy: Basic256Sha256\n    allow_anonymous: false\n    server_certificate: ./cert/server.der\n    server_private_key: ./cert/server-key.pem\n    users:\n      - username: engineer\n        password_env: DF_TEST_PW_1\n        role: writer\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n",
         );
         fs::create_dir_all(root.join("cert")).unwrap();
         fs::write(root.join("cert/server.der"), b"cert").unwrap();
@@ -988,5 +1145,164 @@ mod tests {
         let root = setup("empty_instances", "runtime_version: 1\ninstances: []\n");
         let error = HostConfig::load(&root.join("runtime.yaml")).unwrap_err();
         assert!(error.to_string().contains("must not be empty"), "{error}");
+    }
+
+    /// SignAndEncrypt security body with a `users` block placed inside the
+    /// security section, plus dummy certificate files created in the config
+    /// directory (existence is checked, not the content).
+    fn secure_body(users_block: &str, allow_anonymous: bool) -> String {
+        format!(
+            "runtime_version: 1\nopcua:\n  enabled: true\n  endpoint_url: \"opc.tcp://127.0.0.1:4840\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime:ns\"\n  security:\n    mode: SignAndEncrypt\n    policy: Basic256Sha256\n    allow_anonymous: {allow_anonymous}\n    server_certificate: ./cert/server.der\n    server_private_key: ./cert/server-key.pem\n{users_block}instances:\n  - id: a\n    project: ./two_tank.yaml\n"
+        )
+    }
+
+    const USERS_ENGINEER_VIEWER: &str = "    users:\n      - username: engineer\n        password_env: DF_TEST_PW_1\n        role: writer\n      - username: viewer\n        password_env: DF_TEST_PW_2\n        role: reader\n";
+
+    fn setup_with_certs(name: &str, config_body: &str) -> PathBuf {
+        let root = setup(name, config_body);
+        let cert_dir = root.join("cert");
+        fs::create_dir_all(&cert_dir).unwrap();
+        fs::write(cert_dir.join("server.der"), b"dummy").unwrap();
+        fs::write(cert_dir.join("server-key.pem"), b"dummy").unwrap();
+        root
+    }
+
+    #[test]
+    fn users_section_parses_roles_and_defaults() {
+        let body = secure_body(USERS_ENGINEER_VIEWER, false);
+        let root = setup_with_certs("users_parse", &body);
+        let config = HostConfig::load(&root.join("runtime.yaml")).unwrap();
+        let opcua = config.opcua.unwrap();
+        assert!(!opcua.security.allow_anonymous);
+        assert_eq!(opcua.security.users.len(), 2);
+        assert_eq!(opcua.security.users[0].username, "engineer");
+        assert_eq!(opcua.security.users[0].role, UserRole::Writer);
+        assert_eq!(opcua.security.users[0].password_env, "DF_TEST_PW_1");
+        assert_eq!(opcua.security.users[1].role, UserRole::Reader);
+
+        // No users block at all resolves to an empty list.
+        let root = setup_with_certs("users_default", &secure_body("", true));
+        let config = HostConfig::load(&root.join("runtime.yaml")).unwrap();
+        assert!(config.opcua.unwrap().security.users.is_empty());
+
+        // Unknown role names are rejected by the strict parser.
+        let body = secure_body(
+            "    users:\n      - username: engineer\n        password_env: DF_TEST_PW_1\n        role: admin\n",
+            true,
+        );
+        let root = setup_with_certs("users_bad_role", &body);
+        let error = HostConfig::load(&root.join("runtime.yaml")).unwrap_err();
+        assert!(error.to_string().contains("unknown variant"), "{error}");
+    }
+
+    #[test]
+    fn user_definitions_are_validated() {
+        // Duplicate usernames.
+        let body = secure_body(
+            "    users:\n      - username: engineer\n        password_env: DF_TEST_PW_1\n        role: writer\n      - username: engineer\n        password_env: DF_TEST_PW_2\n        role: reader\n",
+            true,
+        );
+        let root = setup_with_certs("users_dup", &body);
+        let error = HostConfig::load(&root.join("runtime.yaml")).unwrap_err();
+        assert!(error.to_string().contains("duplicate username"), "{error}");
+
+        // The anonymous token id is reserved.
+        let body = secure_body(
+            "    users:\n      - username: anonymous\n        password_env: DF_TEST_PW_1\n        role: writer\n",
+            true,
+        );
+        let root = setup_with_certs("users_anonymous", &body);
+        let error = HostConfig::load(&root.join("runtime.yaml")).unwrap_err();
+        assert!(error.to_string().contains("is invalid"), "{error}");
+
+        // Empty password_env.
+        let body = secure_body(
+            "    users:\n      - username: engineer\n        password_env: \"\"\n        role: writer\n",
+            true,
+        );
+        let root = setup_with_certs("users_no_env", &body);
+        let error = HostConfig::load(&root.join("runtime.yaml")).unwrap_err();
+        assert!(error.to_string().contains("password_env"), "{error}");
+
+        // Username/password is refused on an unsecured channel (§9.1: the
+        // credentials would travel as plaintext).
+        let root = setup(
+            "users_plaintext",
+            "runtime_version: 1\nopcua:\n  enabled: true\n  endpoint_url: \"opc.tcp://127.0.0.1:4840\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime:ns\"\n  security:\n    allow_anonymous: true\n    users:\n      - username: engineer\n        password_env: DF_TEST_PW_1\n        role: writer\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n",
+        );
+        let error = HostConfig::load(&root.join("runtime.yaml")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires security.mode and security.policy other than None"),
+            "{error}"
+        );
+
+        // Anonymous disabled plus no users means no identity can connect.
+        let root = setup_with_certs("users_no_identity", &secure_body("", false));
+        let error = HostConfig::load(&root.join("runtime.yaml")).unwrap_err();
+        assert!(
+            error.to_string().contains("would accept no identity"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn resolve_user_credentials_reads_the_environment() {
+        let security = OpcUaSecurityConfig {
+            users: vec![OpcUaUserConfig {
+                username: "engineer".into(),
+                password_env: "DF_TEST_RESOLVE_PW".into(),
+                role: UserRole::Writer,
+            }],
+            ..Default::default()
+        };
+
+        // Missing variable is named in the error.
+        std::env::remove_var("DF_TEST_RESOLVE_PW");
+        let error = resolve_user_credentials(&security).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("DF_TEST_RESOLVE_PW") && message.contains("is not set"),
+            "{error}"
+        );
+
+        // Empty password is rejected.
+        std::env::set_var("DF_TEST_RESOLVE_PW", "");
+        let error = resolve_user_credentials(&security).unwrap_err();
+        assert!(error.to_string().contains("is empty"), "{error}");
+
+        // Present password resolves into plain credentials.
+        std::env::set_var("DF_TEST_RESOLVE_PW", "s3cret");
+        let users = resolve_user_credentials(&security).unwrap();
+        assert_eq!(
+            users,
+            vec![PlainUserCredentials {
+                username: "engineer".into(),
+                password: "s3cret".into(),
+            }]
+        );
+        std::env::remove_var("DF_TEST_RESOLVE_PW");
+    }
+
+    #[test]
+    fn write_wait_timeout_bounds_are_validated() {
+        for (name, value) in [("zero", 0), ("too_large", 300_001)] {
+            let body = format!(
+                "runtime_version: 1\nopcua:\n  enabled: true\n  endpoint_url: \"opc.tcp://127.0.0.1:4840\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime:ns\"\n  write_wait_timeout_ms: {value}\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n"
+            );
+            let root = setup(name, &body);
+            let error = HostConfig::load(&root.join("runtime.yaml")).unwrap_err();
+            assert!(
+                error.to_string().contains("write_wait_timeout_ms"),
+                "{name}: {error}"
+            );
+        }
+
+        // A valid value is kept; the default is None.
+        let body = "runtime_version: 1\nopcua:\n  enabled: true\n  endpoint_url: \"opc.tcp://127.0.0.1:4840\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime:ns\"\n  write_wait_timeout_ms: 500\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n";
+        let root = setup("wait_timeout_ok", body);
+        let config = HostConfig::load(&root.join("runtime.yaml")).unwrap();
+        assert_eq!(config.opcua.unwrap().write_wait_timeout_ms, Some(500));
     }
 }
