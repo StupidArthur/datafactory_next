@@ -19,9 +19,10 @@
 //!    batches without applying them (WR-09),
 //! 5. one request spanning two instances: instance A's invalid tag withholds
 //!    only A's batch while instance B's valid batch commits (§8.3),
-//! 6. the R9 dual-tank closed loop: two instances, two independent client
-//!    sessions, a setpoint write on A that the model responds to, and B
-//!    isolated from it (CL-01/CL-02).
+//! 6. the R9 two-instance process-input example: two independent sessions,
+//!    an inlet-flow write on A, and B isolated from it,
+//! 7. the PID setpoint example: an external level setpoint drives PID output,
+//!    valve position and both tank levels through a real Engine.
 //!
 //! Certificate and PKI handling follows the proven R5/R7 pattern: every
 //! fixture generates a fresh sample keypair for the server, and every client
@@ -988,7 +989,6 @@ async fn multi_instance_request_vetoes_one_batch_without_blocking_the_other() {
     engineer.disconnect().await.unwrap();
 }
 
-
 /// External setpoint → PID → valve → two tanks → PID feedback (§14.5 CL-01/CL-02).
 ///
 /// The project starts near a steady operating point. The client first raises
@@ -997,7 +997,7 @@ async fn multi_instance_request_vetoes_one_batch_without_blocking_the_other() {
 /// physical lag.
 #[tokio::test]
 async fn opcua_pid_setpoint_controls_valve_and_two_tank_levels() {
-    let mut fixture = start_fixture("pid_closed_loop", &pid_closed_loop_project(), 32, None);
+    let fixture = start_fixture("pid_closed_loop", &pid_closed_loop_project(), 32, None);
     let session = connect_user(
         "pid_closed_loop_client",
         "engineer",
@@ -1137,7 +1137,13 @@ async fn opcua_pid_setpoint_controls_valve_and_two_tank_levels() {
 
     let high_values = read_values(
         &session,
-        &[pid_sv.clone(), pid_pv.clone(), pid_mv.clone(), valve_target.clone(), valve_opening.clone()],
+        &[
+            pid_sv.clone(),
+            pid_pv.clone(),
+            pid_mv.clone(),
+            valve_target.clone(),
+            valve_opening.clone(),
+        ],
     )
     .await;
     assert!((as_double(&high_values[0]) - 0.40).abs() < 1e-9);
