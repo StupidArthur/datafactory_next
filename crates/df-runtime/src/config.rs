@@ -8,7 +8,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -646,11 +646,29 @@ fn resolve_project(
 }
 
 /// Join relative paths onto `base_dir`; absolute paths pass through unchanged.
+/// `.` components are dropped afterwards so that `project: ./x.yaml` resolves
+/// to `<config dir>\x.yaml` rather than `<config dir>\.\x.yaml`; `..` is left
+/// alone because resolving it lexically would change meaning across symlinks.
 fn resolve_relative(base_dir: &Path, raw: &Path) -> PathBuf {
-    if raw.is_absolute() {
+    let joined = if raw.is_absolute() {
         raw.to_path_buf()
     } else {
         base_dir.join(raw)
+    };
+    drop_cur_dir(&joined)
+}
+
+/// Rebuild `path` without `.` components, preserving the prefix and root.
+fn drop_cur_dir(path: &Path) -> PathBuf {
+    let normalized: PathBuf = path
+        .components()
+        .filter(|component| !matches!(component, Component::CurDir))
+        .collect();
+    if normalized.as_os_str().is_empty() {
+        // `path` was literally `.` (or empty); keep it as given.
+        path.to_path_buf()
+    } else {
+        normalized
     }
 }
 
@@ -745,7 +763,12 @@ mod tests {
             UNIQUE.fetch_add(1, Ordering::SeqCst)
         ));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        // `HostConfig::load` canonicalizes the config path before resolving
+        // relative entries; on Windows that expands 8.3 short names (CI's
+        // `RUNNER~1` becomes `runneradmin`). Expectations must be built from
+        // the same representation, otherwise the test compares two valid
+        // spellings of the same directory.
+        canonicalize_simple(&dir).expect("temporary directory must canonicalize")
     }
 
     /// Create a config directory containing `two_tank.yaml` and a runtime.yaml.
@@ -871,6 +894,14 @@ mod tests {
             assert!(
                 instance.project.is_absolute(),
                 "project path must be absolute: {}",
+                instance.project.display()
+            );
+            assert!(
+                !instance
+                    .project
+                    .components()
+                    .any(|component| matches!(component, Component::CurDir)),
+                "resolved project path must not keep `.` components: {}",
                 instance.project.display()
             );
             assert_eq!(instance.project, root.join("two_tank.yaml"));
