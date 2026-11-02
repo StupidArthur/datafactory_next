@@ -4,19 +4,21 @@
 //! runtime (`ServerBuilder` and the server futures are not `Send`), serves
 //! the configured endpoint and builds the §7.2 address space from the
 //! instance Tag Catalogs (`address_space`); `value` maps between DataFactory
-//! tag types and OPC UA types. R7 adds snapshot publishing, R8 the write
-//! handler.
+//! tag types and OPC UA types; `publisher` streams engine snapshots and
+//! runtime status into the address space (§7.5). R8 adds the write handler.
 //!
 //! The `opcua` cargo feature gates this whole module: default builds never
 //! compile or link any OPC UA code (design §9.2).
 
 pub mod address_space;
+pub mod publisher;
 pub mod value;
 
 pub use address_space::{
     validate_catalogs, AddressSpaceIndex, InstanceCatalog, InstanceNodes, TagEntry,
     INSTANCE_STATUS_NODES, SERVER_STATUS_NODES,
 };
+pub use publisher::{SnapshotPublisher, DEFAULT_STATUS_REFRESH_INTERVAL};
 pub use value::{
     percent_encode, status_node_identifier, tag_node_identifier, ua_data_type, value_to_variant,
     variant_to_value,

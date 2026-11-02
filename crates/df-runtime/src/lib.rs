@@ -376,16 +376,26 @@ impl Runtime {
     pub fn stop(&mut self) -> Result<(), RuntimeError> {
         if let Some(worker) = self.worker.take() {
             request_stop(&self.stop_signal);
-            self.feed.mark_stopped();
-            if worker.join().is_err() {
-                let mut status = self
-                    .status
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                status.state = RuntimeState::Failed;
-                status.last_error = Some("runtime worker panicked".into());
+            let joined = worker.join();
+            if joined.is_err() {
+                {
+                    let mut status = self
+                        .status
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    status.state = RuntimeState::Failed;
+                    status.last_error = Some("runtime worker panicked".into());
+                }
+                // Terminal status first, then the feed notification: a waiter
+                // that receives `WaitOutcome::Stopped` must always observe a
+                // terminal lifecycle state afterwards.
+                self.feed.mark_stopped();
                 return Err(RuntimeError::WorkerPanicked);
             }
+            // The worker has finished updating the lifecycle status; only now
+            // may waiters observe `WaitOutcome::Stopped` (the snapshot
+            // publisher relies on this order, design §7.5).
+            self.feed.mark_stopped();
         }
 
         let status = self.status();
@@ -553,11 +563,14 @@ fn run_worker<E: EngineExecutor>(
                     writes.finish(item.request_id, Err(&RuntimeError::Engine(message.clone())));
                     let _ = item.reply.send(Err(RuntimeError::Engine(message.clone())));
                 }
-                feed.mark_stopped();
+                // Terminal status first, then the feed notification: a waiter
+                // that receives `WaitOutcome::Stopped` must observe the
+                // Failed state, not a stale Running/Stopping one.
                 update_status(&status, |current| {
                     current.state = RuntimeState::Failed;
                     current.last_error = Some(message.clone());
                 });
+                feed.mark_stopped();
                 reject_pending(
                     &receiver,
                     RuntimeError::Engine(message.clone()),
@@ -974,6 +987,50 @@ mod tests {
             handle.submit_writes(BTreeMap::from([("input".into(), Value::Float(1.0))])),
             Err(RuntimeError::WorkerStopped)
         ));
+    }
+
+    #[test]
+    fn waiter_woken_by_stop_observes_a_terminal_status() {
+        // The feed must be marked stopped only after the lifecycle status
+        // reached a terminal state: the OPC UA publisher performs its final
+        // out-of-service write on `WaitOutcome::Stopped` and reads the status
+        // at that moment (design §7.5).
+        let (engine, _) = FakeEngine::new(0.01);
+        let mut runtime = Runtime::start(engine).unwrap();
+        let handle = runtime.handle();
+        assert!(
+            matches!(
+                handle.wait_for_snapshot(handle.snapshot_revision(), Duration::from_secs(2)),
+                WaitOutcome::Changed { .. }
+            ),
+            "the engine must publish at least one cycle first"
+        );
+
+        let waiter = {
+            let handle = handle.clone();
+            thread::spawn(move || {
+                let mut after = handle.snapshot_revision();
+                loop {
+                    match handle.wait_for_snapshot(after, Duration::from_secs(10)) {
+                        WaitOutcome::Changed { revision } => after = revision,
+                        outcome => {
+                            let status = handle.status();
+                            return (outcome, status.state);
+                        }
+                    }
+                }
+            })
+        };
+        // Let the waiter block on the feed before stopping.
+        sleep(Duration::from_millis(50));
+        runtime.stop().unwrap();
+
+        let (outcome, state_at_stop) = waiter.join().unwrap();
+        assert_eq!(outcome, WaitOutcome::Stopped);
+        assert!(
+            matches!(state_at_stop, RuntimeState::Stopped | RuntimeState::Failed),
+            "a waiter woken by Stopped must observe a terminal status, got {state_at_stop:?}"
+        );
     }
 
     #[test]

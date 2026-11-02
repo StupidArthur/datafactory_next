@@ -366,6 +366,69 @@ test result: ok. 4 passed; 0 failed   — df-runtime opcua_poc 集成测试（R5
 - Status 节点在 R6 保持初值（"Starting"/0）：实时值写入归 R7 Snapshot 发布器；写路径当前为地址空间默认存储，与 Engine 的闭环（`RuntimeHandle::submit_writes`）归 R8。
 - percent-encode 仅由单元测试覆盖：编译器 Tag 名限制为 `[A-Za-z0-9_.]`，实际项目不含需转义字符（设计如此，编码路径为未来宽松命名预留）。
 
+## 2026-11-02：R7 验证（Snapshot 周期发布与订阅通知；含 R1 停机协议顺序修复）
+
+范围：`crates/df-runtime` 新增 `src/opcua/publisher.rs`（§7.5 发布器）与 `tests/opcua_publisher.rs`（2 个集成测试）；`Cargo.toml` 注册 `opcua_publisher` 测试目标；`src/opcua/mod.rs` 接线并更新模块文档；`src/lib.rs` 修复 R1 停机协议顺序并新增回归测试。
+
+### 1. 格式与测试
+
+```text
+命令: cargo fmt --all -- --check
+结果: 通过（退出码 0）
+
+命令: cargo test -p df-runtime --features opcua
+结果: 全部目标 0 failed
+
+test result: ok. 72 passed; 0 failed  — df-runtime 单元测试（R6 的 67 + publisher 4 + R1 停机回归 1）
+test result: ok. 2 passed; 0 failed   — df-runtime bin cli 参数解析测试
+test result: ok. 2 passed; 0 failed   — df-runtime host_config 集成测试
+test result: ok. 4 passed; 0 failed   — df-runtime opcua_poc 集成测试
+test result: ok. 2 passed; 0 failed   — df-runtime opcua_publisher 集成测试（新增）
+小计: 82 passed / 0 failed
+
+命令: cargo test --workspace（默认构建，无 opcua feature）
+结果: 通过（退出码 0，无警告）
+合计: 87 passed / 0 failed（df-core 19 + rust_sdk 3 + df-runtime 58 + host_config 2 + cli 2 + df-sdk 3）
+
+命令: cargo tree -p df-runtime（默认）
+结果: 无 async-opcua/tokio/tokio-util；--features opcua 时三者全部出现（§9.2 隔离复验）
+```
+
+### 2. 发布器实现要点（publisher.rs，§7.5）
+
+- 每实例一个 OS 线程阻塞在 `RuntimeHandle::wait_for_snapshot(last_revision, refresh)`：attach 后立即发布当前快照；`Changed` 分支随 cycle 发布；`Timeout` 分支仅在 RuntimeStatus 变化时重发布（默认刷新间隔 `DEFAULT_STATUS_REFRESH_INTERVAL = 200ms`）；`Stopped` 分支做最终发布后退出。
+- 批量一致性（UA-08）：标签值 + 8 项实例 Status 节点合并为一次 `SimpleNodeManager::set_values`（整个批次持一把地址空间写锁），客户端不会读到两个 cycle 的混合值。0.19 `set_values` 无 index_range 时经 `set_data_value` 原样落盘（status/source_timestamp 保留）——这是 BadWaitingForInitialData/BadOutOfService 与 UA-09 源时间戳能到达客户端的关键。
+- 共享服务器状态线程：200ms 轮询聚合 `ServerStatus/{State,InstanceCount,RunningInstanceCount}`，仅在样本变化时写入。
+- §7.5 状态码映射（每实例统一，无逐 tag 质量层）：Starting→BadWaitingForInitialData、Running/Stopping→Good、Stopped/Failed→BadOutOfService；State 字符串用生命周期名；host_state 聚合优先级：任一 Failed→"Failed"、全部终态→"Stopped"、任一 Running→"Running"、任一 Stopping→"Stopping"、空集→"Stopped"、否则→"Starting"。
+- `SnapshotPublisher::start` 校验：未知实例（地址空间未含其 catalog）与重复实例一律拒绝（Config 错误，不留半启动线程）；空实例集允许（宿主可无启用实例）；`stop()` 幂等且 join 全部线程，Drop 兜底。
+- 慢消费者不反压引擎：发布线程只读已发布快照，通知排队/过滤归服务器订阅机制。
+
+### 3. 停机协议顺序修复（R1 缺陷，根因 + 回归）
+
+- 现象：`publisher_streams_cycles_status_and_marks_out_of_service_on_stop` 单独运行稳定、并行复跑复现失败（stop 后等不到 BadOutOfService）。
+- 根因（临时探针定位：宿主侧地址空间直读 + 客户端读 + 发布线程埋点；探针已删除）：`Runtime::stop()` 在 `request_stop` 后**立即** `feed.mark_stopped()`，而 worker 线程要到 join 完成才把状态置为 Stopped——发布线程被 `WaitOutcome::Stopped` 唤醒时 `status()` 仍是 Running，最终发布以 Good 落盘（探针输出 `STOPPED final publish (state=Running)`），BadOutOfService 永远不会出现。
+- 修复（协议：`WaitOutcome::Stopped` 必须保证后续观察到终态）：
+  - `Runtime::stop()` 先 `worker.join()` 再 `feed.mark_stopped()`；join 失败（worker panic）路径先把状态置 Failed 再 mark。
+  - worker 致命引擎错误路径：先 `update_status(Failed)` 再 `feed.mark_stopped()`。
+  - 发布器 `Stopped` 分支增加有界防御性重同步 `wait_for_terminal_status`（终态或 5s 超时；正常路径 join 后立即命中，0ms）。
+- 回归测试 `waiter_woken_by_stop_observes_a_terminal_status`（lib.rs）：并发 waiter 阻塞在 feed 上，owner stop 后被 Stopped 唤醒时必须读到 Stopped/Failed。
+- 修复后验证：探针 5/5（最终发布 state=Stopped，客户端 ~1ms 内读到 BadOutOfService）；opcua_publisher 5/5 稳定。
+
+### 4. 覆盖点（真实 engine 0.5s 周期 + 独立客户端）
+
+- 集成 `publisher_streams_cycles_status_and_marks_out_of_service_on_stop`：State→"Running" 与 ServerStatus 聚合（Running/1/1）；UA-07 订阅 tank_1.level 收到 ≥3 个不同值（引擎每 cycle 水位上升）；实例 Status 节点 CycleTime==0.5、CycleIndex≥3、SimulationTime≥1.5、LastCycleDurationMs≥0；UA-09 标签读带近期 UTC source_timestamp；`runtime.stop()` 后标签 BadOutOfService 且最后一个快照值保留、实例 State→"Stopped"、ServerStatus State→"Stopped"、RunningInstanceCount→0；publisher.stop() 幂等；端口释放。
+- 集成 `publisher_rejects_unknown_and_duplicate_instances`：未知实例报 "unknown opcua publisher instance"；重复 tank-a 报 "duplicate"；空实例集允许启动后干净停止。
+- publisher 单元测试（4）：State 字符串跟随生命周期名、§7.5 状态码映射、host_state 聚合矩阵（空集/全 Starting/Running 混合/Stopping 混合/Stopped/Failed 组合）、status_values 的 §7.2 名称与类型（CycleTime 0.5→Double、CycleIndex 7→UInt64、LastCycleDurationMs 250µs→0.25 等）。
+
+### 5. 边界说明（未验证项）
+
+- UA-02（独立客户端 Browse DataFactory/Instances 层级）与完整 UA-05 客户端类型矩阵归 R9 闭环测试。
+- Starting 窗口的 BadWaitingForInitialData 未做客户端验证：映射由单元测试覆盖，集成测试在实例 Running 后接入（两水箱启动不足一个 cycle，客户端可观测窗口极窄）。
+- ServerStatus State 聚合语义较简单（按优先级聚合，无部分降级/未知态概念），与 §7.2 设计一致，但客户端侧只断言了 Running/Stopped 两个聚合值。
+- 停机瞬间订阅是否推送最终 BadOutOfService 通知未显式断言（验证的是读路径；通知路径由服务器订阅机制保证）。
+- LastCycleDurationMs 仅断言 ≥0，未校验数值合理性。
+- 环境说明：全部 cargo 命令以 `CARGO_TARGET_DIR=D:\cargo_target_df` 在 D: 盘构建（会话环境变量，未改仓库配置）。
+
 
 
 

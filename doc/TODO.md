@@ -385,7 +385,7 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
 - [x] 服务器生命周期（opcua/mod.rs，3 个单元测试 + PoC 覆盖）：专用 OS 线程 + current_thread tokio runtime（ServerBuilder 非 Send）；ready 消息前先绑定 tokio TcpListener，端口占用在 ready 阶段同步干净失败（专项测试占用端口启动必失败）；ready 后 TCP 探测确认端点可接受连接（为 R8 退出码 4 提供检测路径）；stop() 取消 token + join 线程，幂等，Drop 调 stop。
 - [x] 依赖隔离（§9.2）：`cargo tree -p df-runtime`（默认）无 async-opcua/tokio/tokio-util；`--features opcua` 时三者全部出现。opcua 模块与 opcua_poc 测试目标均以 required-features 门控。
 - [x] 环境说明：G: 盘构建空间不足（曾到 0 空闲），`cargo clean` 回收 4.7 GB 后，全部 cargo 命令通过 `CARGO_TARGET_DIR=D:\cargo_target_df` 在 D: 盘构建（会话环境变量，未改配置文件）。
-- [x] R6 已将 PoC 节点替换为 Tag Catalog 驱动的 §7.2 地址空间（见 R6 验证记录）；剩余：快照周期发布（R7）、写处理器与 allow_anonymous 认证器及用户配置（R8）随后接入；退出码 4 的 CLI 接线在 R8 验证。
+- [x] R6 已将 PoC 节点替换为 Tag Catalog 驱动的 §7.2 地址空间（见 R6 验证记录）；R7 已接入快照周期发布（见 R7 验证记录）；剩余：写处理器与 allow_anonymous 认证器及用户配置（R8）随后接入；退出码 4 的 CLI 接线在 R8 验证。
 - 证据：`doc/engineering/verification-log.md#2026-11-02-r5-验证`。
 
 ### 2026-11-02：R6 验证（Tag Catalog → NodeId/Variant/AccessLevel 映射）
@@ -402,6 +402,18 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
 - [~] 边界：UA-02（独立客户端 Browse Instances/Tags 层级）与客户端侧完整 UA-05 类型矩阵验证归 R9 闭环测试（R6 已由直读覆盖 FLOAT64/String/UInt32/UInt64，BOOL/INT64 变体映射由 value.rs 单元测试覆盖）；Status 节点在 R6 保持初始值（"Starting"/0），实时值由 R7 发布器写入；写路径当前为 SimpleNodeManager 默认存储，R8 改为 `RuntimeHandle::submit_writes` 闭环。
 - 证据：`doc/engineering/verification-log.md#2026-11-02-r6-验证`。
 
+### 2026-11-02：R7 验证（Snapshot 周期发布与订阅通知；含 R1 停机协议顺序修复）
+
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test -p df-runtime --features opcua` 通过：82 个测试全部通过（df-runtime lib 72 = R6 的 67 + publisher 4 个单元测试 + R1 停机协议回归测试 1、bin cli 2、host_config 2、opcua_poc 4、opcua_publisher 2）。
+- [x] `cargo test --workspace`（默认构建）通过：87 个测试全部通过、0 警告（df-core 19 + rust_sdk 3 + df-runtime 58 + host_config 2 + cli 2 + df-sdk 3）。
+- [x] 依赖隔离复验（§9.2）：`cargo tree -p df-runtime`（默认）无 async-opcua/tokio/tokio-util；`--features opcua` 时三者全部出现。
+- [x] `opcua/publisher.rs`（§7.5，4 个单元测试）：每实例一个发布线程阻塞在 `wait_for_snapshot`；标签 + 8 项实例 Status 经 `set_values` 单锁批量写（UA-08：客户端不会读到两个 cycle 的混合值）；共享服务器状态线程 200ms 聚合 ServerStatus；§7.5 状态码映射（Starting→BadWaitingForInitialData、Running/Stopping→Good、Stopped/Failed→BadOutOfService）；host_state 聚合（任一 Failed→Failed、全部终态→Stopped、任一 Running→Running、任一 Stopping→Stopping、空→Stopped、否则 Starting）；`start` 拒绝未知/重复实例；stop 幂等 + Drop 兜底。
+- [x] 集成测试（opcua_publisher，2 个，真实 engine + server + 独立客户端）：订阅收到 ≥3 个不同 level 值（UA-07）；实例 Status 节点 CycleTime==0.5、CycleIndex/SimulationTime 推进、LastCycleDurationMs≥0；ServerStatus 聚合（Running/1/1 → 停机后 RunningInstanceCount=0）；标签读带近期 UTC source_timestamp（UA-09）；stop 后标签 BadOutOfService 且最后一个快照值保留、State→"Stopped"；stop 幂等、端口释放；未知/重复实例启动即拒绝。
+- [x] R1 停机协议顺序修复（缺陷根因定位 + 回归测试）：原 `Runtime::stop()` 在 join 前就 `feed.mark_stopped()`，发布线程被 `WaitOutcome::Stopped` 唤醒时读到 Running 并以 Good 做"最终发布"（并行复跑复现，BadOutOfService 偶发缺失）。修复：stop() 先 join worker 再 mark_stopped（panic 路径先置 Failed 再 mark）；worker 致命错误路径先置 Failed 再 mark_stopped；发布器 Stopped 分支增加有界终态重同步（wait_for_terminal_status，5s 上限）。回归测试 `waiter_woken_by_stop_observes_a_terminal_status`：并发 waiter 被 Stopped 唤醒时必须观察到终态。修复后探针 5/5、发布器测试 5/5 稳定。
+- [~] 边界：UA-02 Browse 与完整 UA-05 客户端矩阵归 R9；Starting 窗口的 BadWaitingForInitialData 未做客户端验证（仅单元测试覆盖映射，集成测试在 Running 后接入）；ServerStatus State 聚合语义较简单（按优先级聚合，与 §7.2 设计一致）；停机瞬间对订阅推送最终 BadOutOfService 通知未显式断言（验证的是读路径）。
+- 证据：`doc/engineering/verification-log.md#2026-11-02-r7-验证`。
+
 
 ## 13. Runtime 系统设计基线
 
@@ -414,7 +426,7 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
   - [x] R4 CLI Host 模式（run --config / check）、多实例状态与优雅停止。（2026-11-02）
   - [x] R5 OPC UA 库 PoC、Endpoint 与安全配置。（2026-11-02，见 §12 R5 验证记录）
   - [x] R6 Tag Catalog → NodeId/Variant/AccessLevel 映射。（2026-11-02，见 §12 R6 验证记录）
-  - [ ] R7 Snapshot 周期发布与订阅通知。
+  - [x] R7 Snapshot 周期发布与订阅通知。（2026-11-02，见 §12 R7 验证记录；含 R1 停机协议顺序修复）
   - [ ] R8 OPC UA Write Handler、批次聚合、确认与取消。
   - [ ] R9 双水箱闭环案例与独立客户端自动化测试。
   - [ ] R10 Monitor 指标、报警、归档。

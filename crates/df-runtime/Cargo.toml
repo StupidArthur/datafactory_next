@@ -26,3 +26,7 @@ path = "src/main.rs"
 [[test]]
 name = "opcua_poc"
 required-features = ["opcua"]
+
+[[test]]
+name = "opcua_publisher"
+required-features = ["opcua"]
