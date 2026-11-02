@@ -26,5 +26,14 @@ jobs:
         uses: actions/checkout@v4
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: Run focused real-client PID closed-loop test
-        run: cargo test --locked -p df-runtime --features opcua --test opcua_write opcua_pid_setpoint_controls_valve_and_two_tank_levels -- --nocapture
+      - name: Verify the focused test exists
+        shell: pwsh
+        run: |
+          $testName = "opcua_pid_setpoint_controls_valve_and_two_tank_levels"
+          $listed = cargo test --locked -p df-runtime --features opcua --test opcua_write -- --list
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not ($listed -contains ($testName + ": test"))) {
+            throw "Expected integration test '$testName' was not found."
+          }
+      - name: Run the real-client PID closed-loop test
+        run: cargo test --locked -p df-runtime --features opcua --test opcua_write opcua_pid_setpoint_controls_valve_and_two_tank_levels -- --exact --nocapture
