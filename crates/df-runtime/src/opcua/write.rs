@@ -208,14 +208,17 @@ impl WriteHandlerState {
     }
 
     /// Validate one write operation against the §8.4 mapping. Returns the
-    /// pending submission on success or the response status code.
+    /// pending submission on success or the rejection status code. A rejection
+    /// carries the instance id whenever the target is a known tag: that
+    /// instance's whole batch must then be withheld (§8.3).
     fn validate_write(
         &self,
         write: &ParsedWriteValue,
         role: UserRole,
-    ) -> Result<PendingWrite, StatusCode> {
+    ) -> Result<PendingWrite, WriteRejection> {
         // Unknown node (WR-04): non-string identifiers are never ours.
-        let key = node_key(&write.node_id).ok_or(StatusCode::BadNodeIdUnknown)?;
+        let key = node_key(&write.node_id)
+            .ok_or_else(|| WriteRejection::new(StatusCode::BadNodeIdUnknown))?;
         let maps = self
             .maps
             .read()
@@ -223,31 +226,35 @@ impl WriteHandlerState {
         // Host-owned nodes (status, folders, server status) are never
         // writable; §8.4 maps this to BadNotWritable.
         if maps.host_owned.contains(&key) {
-            return Err(StatusCode::BadNotWritable);
+            return Err(WriteRejection::new(StatusCode::BadNotWritable));
         }
-        let tag = maps.tags.get(&key).ok_or(StatusCode::BadNodeIdUnknown)?;
+        let tag = maps
+            .tags
+            .get(&key)
+            .ok_or_else(|| WriteRejection::new(StatusCode::BadNodeIdUnknown))?;
+        let reject = |status| WriteRejection::for_tag(status, tag);
         // Only the Value attribute of tag variables can be written.
         if write.attribute_id != AttributeId::Value {
-            return Err(StatusCode::BadNotWritable);
+            return Err(reject(StatusCode::BadNotWritable));
         }
         // Array/index-range writes are not part of the tag model.
         if write.index_range != NumericRange::None {
-            return Err(StatusCode::BadIndexRangeInvalid);
+            return Err(reject(StatusCode::BadIndexRangeInvalid));
         }
         let Some(data_value) = write.value.value.as_ref() else {
             // A Write operation without a value has nothing to do.
-            return Err(StatusCode::BadNothingToDo);
+            return Err(reject(StatusCode::BadNothingToDo));
         };
         // Read-only protection comes before the identity check (§8.4 order).
         if !tag.writable {
-            return Err(StatusCode::BadNotWritable);
+            return Err(reject(StatusCode::BadNotWritable));
         }
         if role != UserRole::Writer {
-            return Err(StatusCode::BadUserAccessDenied);
+            return Err(reject(StatusCode::BadUserAccessDenied));
         }
         // Exact type match, no coercion (WR-03).
-        let value =
-            variant_to_value(data_value, &tag.data_type).ok_or(StatusCode::BadTypeMismatch)?;
+        let value = variant_to_value(data_value, &tag.data_type)
+            .ok_or_else(|| reject(StatusCode::BadTypeMismatch))?;
         Ok(PendingWrite {
             instance_id: tag.instance_id.clone(),
             tag_name: tag.tag_name.clone(),
@@ -258,9 +265,11 @@ impl WriteHandlerState {
     /// The overridden write service (§8.2/§8.3).
     ///
     /// Per-node statuses are always set and `Ok(())` is returned, so the
-    /// service layer reports one status per operation. On the first invalid
-    /// node the whole request is rejected without submitting anything
-    /// (WR-05): valid nodes answer `BadNothingToDo`.
+    /// service layer reports one status per operation. Invalid nodes never
+    /// enter a batch; a valid node whose own instance has an invalid node in
+    /// the same request answers `BadNothingToDo` (WR-05). Instances are
+    /// independent: another instance's invalid write does not veto this
+    /// instance's valid batch.
     pub(crate) async fn handle_write(
         &self,
         context: &RequestContext,
@@ -268,10 +277,10 @@ impl WriteHandlerState {
     ) -> Result<(), StatusCode> {
         let role = self.role_for(&context.token.0, context.token.is_anonymous());
 
-        // Phase 1 — validate every operation (§8.3: one invalid Tag rejects
-        // the batch).
+        // Phase 1 — validate every operation (§8.3). Invalid nodes get their
+        // specific status; an invalid tag vetoes its own instance only.
         let mut valid: Vec<(usize, PendingWrite)> = Vec::new();
-        let mut invalid = false;
+        let mut vetoed_instances: BTreeSet<String> = BTreeSet::new();
         for (index, node) in nodes_to_write.iter_mut().enumerate() {
             // Keep a more specific pre-set parse error (e.g.
             // BadAttributeIdInvalid); the pre-set status of a node whose
@@ -279,22 +288,18 @@ impl WriteHandlerState {
             let preset = node.status();
             match self.validate_write(node.value(), role) {
                 Ok(pending) => valid.push((index, pending)),
-                Err(status) => {
+                Err(rejection) => {
                     let reported = if preset.is_bad() && preset != StatusCode::BadNodeIdUnknown {
                         preset
                     } else {
-                        status
+                        rejection.status
                     };
                     node.set_status(reported);
-                    invalid = true;
+                    if let Some(instance_id) = rejection.instance_id {
+                        vetoed_instances.insert(instance_id);
+                    }
                 }
             }
-        }
-        if invalid {
-            for (index, _) in valid {
-                nodes_to_write[index].set_status(StatusCode::BadNothingToDo);
-            }
-            return Ok(());
         }
 
         // Phase 2 — group by instance (§8.3: per-instance batches; no
@@ -308,6 +313,14 @@ impl WriteHandlerState {
         }
 
         for (instance_id, group) in groups {
+            // One invalid tag in this instance's batch withholds the whole
+            // instance batch without touching the other instances.
+            if vetoed_instances.contains(&instance_id) {
+                for (index, _) in group {
+                    nodes_to_write[index].set_status(StatusCode::BadNothingToDo);
+                }
+                continue;
+            }
             let handle = self
                 .handles
                 .lock()
@@ -387,6 +400,34 @@ struct PendingWrite {
     instance_id: String,
     tag_name: String,
     value: Value,
+}
+
+/// Why one write operation was refused (§8.4). `instance_id` is present when
+/// the target is a known tag: the operation then belongs to that instance's
+/// batch, so the batch must be withheld as a whole (§8.3).
+#[derive(Debug)]
+struct WriteRejection {
+    status: StatusCode,
+    instance_id: Option<String>,
+}
+
+impl WriteRejection {
+    /// A rejection that cannot be attributed to an instance (unknown node,
+    /// host-owned node): it vetoes no batch.
+    fn new(status: StatusCode) -> Self {
+        Self {
+            status,
+            instance_id: None,
+        }
+    }
+
+    /// A rejection of a known tag: the tag's instance batch is vetoed.
+    fn for_tag(status: StatusCode, tag: &TagTarget) -> Self {
+        Self {
+            status,
+            instance_id: Some(tag.instance_id.clone()),
+        }
+    }
 }
 
 /// Host-side write failures are host bugs, not client errors: log them for
@@ -511,6 +552,10 @@ mod tests {
         }
     }
 
+    fn rejected(state: &WriteHandlerState, write: &ParsedWriteValue, role: UserRole) -> StatusCode {
+        state.validate_write(write, role).unwrap_err().status
+    }
+
     const FLOW: &str = "df/instances/a/tags/flow";
     const LEVEL: &str = "df/instances/a/tags/level";
 
@@ -523,7 +568,7 @@ mod tests {
         // Unknown string node (WR-04).
         let write = value_write("df/instances/a/tags/missing", Variant::Double(1.0));
         assert_eq!(
-            state.validate_write(&write, UserRole::Writer).unwrap_err(),
+            rejected(&state, &write, UserRole::Writer),
             StatusCode::BadNodeIdUnknown
         );
         // Non-string identifiers are never ours.
@@ -534,7 +579,7 @@ mod tests {
             value: DataValue::value_only(Variant::Double(1.0)),
         };
         assert_eq!(
-            state.validate_write(&write, UserRole::Writer).unwrap_err(),
+            rejected(&state, &write, UserRole::Writer),
             StatusCode::BadNodeIdUnknown
         );
     }
@@ -548,7 +593,7 @@ mod tests {
         // Status node: BadNotWritable despite a valid value.
         let write = value_write("df/instances/a/status/CycleIndex", Variant::UInt64(7));
         assert_eq!(
-            state.validate_write(&write, UserRole::Writer).unwrap_err(),
+            rejected(&state, &write, UserRole::Writer),
             StatusCode::BadNotWritable
         );
         // Non-Value attribute on a tag variable.
@@ -559,7 +604,7 @@ mod tests {
             value: DataValue::value_only(Variant::String("x".into())),
         };
         assert_eq!(
-            state.validate_write(&write, UserRole::Writer).unwrap_err(),
+            rejected(&state, &write, UserRole::Writer),
             StatusCode::BadNotWritable
         );
     }
@@ -577,7 +622,7 @@ mod tests {
             value: DataValue::value_only(Variant::Double(1.0)),
         };
         assert_eq!(
-            state.validate_write(&write, UserRole::Writer).unwrap_err(),
+            rejected(&state, &write, UserRole::Writer),
             StatusCode::BadIndexRangeInvalid
         );
         // A Write without a value has nothing to do.
@@ -588,7 +633,7 @@ mod tests {
             value: DataValue::default(),
         };
         assert_eq!(
-            state.validate_write(&write, UserRole::Writer).unwrap_err(),
+            rejected(&state, &write, UserRole::Writer),
             StatusCode::BadNothingToDo
         );
     }
@@ -602,7 +647,7 @@ mod tests {
         let write = value_write(LEVEL, Variant::Double(1.0));
         // Even a Writer is rejected: the catalog decides (WR-02).
         assert_eq!(
-            state.validate_write(&write, UserRole::Writer).unwrap_err(),
+            rejected(&state, &write, UserRole::Writer),
             StatusCode::BadNotWritable
         );
     }
@@ -616,7 +661,7 @@ mod tests {
         let write = value_write(FLOW, Variant::Double(1.0));
         // Readers — anonymous, registered or unknown — are rejected (SEC-04).
         assert_eq!(
-            state.validate_write(&write, UserRole::Reader).unwrap_err(),
+            rejected(&state, &write, UserRole::Reader),
             StatusCode::BadUserAccessDenied
         );
     }
@@ -633,13 +678,13 @@ mod tests {
         // String into a FLOAT64 tag (WR-03).
         let write = value_write(FLOW, Variant::String("fast".into()));
         assert_eq!(
-            state.validate_write(&write, UserRole::Writer).unwrap_err(),
+            rejected(&state, &write, UserRole::Writer),
             StatusCode::BadTypeMismatch
         );
         // Numeric near-miss: Int64 into FLOAT64 must not coerce.
         let write = value_write(FLOW, Variant::Int64(2));
         assert_eq!(
-            state.validate_write(&write, UserRole::Writer).unwrap_err(),
+            rejected(&state, &write, UserRole::Writer),
             StatusCode::BadTypeMismatch
         );
         // Correct types map onto the tag name and value.
@@ -668,5 +713,37 @@ mod tests {
     fn wait_override_takes_precedence() {
         let state = WriteHandlerState::new(BTreeMap::new(), Some(Duration::from_millis(250)));
         assert_eq!(state.wait_override, Some(Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn rejections_of_known_tags_name_their_instance_for_batch_vetoes() {
+        let state = state_with(
+            &[(FLOW, true, "FLOAT64"), (LEVEL, false, "FLOAT64")],
+            &[("engineer", UserRole::Writer)],
+        );
+
+        // A known tag's rejection vetoes exactly that tag's instance batch.
+        let write = value_write(LEVEL, Variant::Double(1.0));
+        let rejection = state.validate_write(&write, UserRole::Writer).unwrap_err();
+        assert_eq!(rejection.status, StatusCode::BadNotWritable);
+        assert_eq!(rejection.instance_id.as_deref(), Some("a"));
+
+        // Rejections outside any tag batch veto nothing.
+        let write = value_write("df/instances/a/tags/missing", Variant::Double(1.0));
+        assert_eq!(
+            state
+                .validate_write(&write, UserRole::Writer)
+                .unwrap_err()
+                .instance_id,
+            None
+        );
+        let write = value_write("df/instances/a/status/CycleIndex", Variant::UInt64(7));
+        assert_eq!(
+            state
+                .validate_write(&write, UserRole::Writer)
+                .unwrap_err()
+                .instance_id,
+            None
+        );
     }
 }

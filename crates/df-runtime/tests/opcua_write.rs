@@ -10,13 +10,15 @@
 //! 1. the rejection matrix — read-only tags, type mismatches, index ranges,
 //!    value-less writes, unknown nodes, host-owned status nodes and Readers
 //!    are all rejected per the §8.4 mapping without side effects, and one
-//!    invalid node rejects the whole request (WR-02..05, SEC-04),
+//!    invalid node rejects its whole instance batch (WR-02..05, SEC-04),
 //! 2. Writer writes take effect at cycle boundaries, in order, and the model
 //!    responds (WR-01/WR-07/WR-08),
 //! 3. a full queue rejects immediately and keeps the queued batch; a timed
 //!    out write is indeterminate and still applies (WR-06, §8.5.4),
 //! 4. stopping the instance rejects later writes and discards pending
-//!    batches without applying them (WR-09).
+//!    batches without applying them (WR-09),
+//! 5. one request spanning two instances: instance A's invalid tag withholds
+//!    only A's batch while instance B's valid batch commits (§8.3).
 //!
 //! Certificate and PKI handling follows the proven R5/R7 pattern: every
 //! fixture generates a fresh sample keypair for the server, and every client
@@ -32,7 +34,7 @@ use df_runtime::opcua::{
 };
 use df_runtime::{
     load_engine, OpcUaConfig, OpcUaSecurityConfig, OverrunPolicy, Runtime, RuntimeConfig,
-    SecurityMode, SecurityPolicy,
+    RuntimeHandle, SecurityMode, SecurityPolicy,
 };
 use opcua::client::{ClientBuilder, IdentityToken, Password};
 use opcua::crypto::SecurityPolicy as UaSecurityPolicy;
@@ -42,8 +44,12 @@ use opcua::types::{
 };
 
 const INSTANCE: &str = "tank-a";
+const SECOND_INSTANCE: &str = "tank-b";
 const INLET: &str = "plant_inlet_flow";
 const LEVEL: &str = "tank_1.level";
+/// Initial value of `plant_inlet_flow` in the two-tank project; the reference
+/// for "the write was never applied".
+const INITIAL_INLET: f64 = 0.0012;
 
 fn two_tank_project() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/two-tank/two-tank.dfproject")
@@ -199,6 +205,115 @@ fn start_fixture(
         runtime,
         index,
         endpoint_url: config.endpoint_url.clone(),
+    }
+}
+
+/// Two independent runtime instances behind one secure server, used to prove
+/// per-instance batch boundaries (§8.3).
+struct DualWriteFixture {
+    server: OpcUaServer,
+    _publisher: SnapshotPublisher,
+    runtime_a: Runtime,
+    runtime_b: Runtime,
+    index: AddressSpaceIndex,
+    endpoint_url: String,
+}
+
+impl Drop for DualWriteFixture {
+    fn drop(&mut self) {
+        let _ = self.runtime_a.stop();
+        let _ = self.runtime_b.stop();
+        self.server.stop();
+    }
+}
+
+impl DualWriteFixture {
+    fn tag(&self, instance_id: &str, tag_name: &str) -> NodeId {
+        self.index
+            .tag(instance_id, tag_name)
+            .unwrap()
+            .node_id
+            .clone()
+    }
+
+    /// The engine-level value of `plant_inlet_flow` for one instance, i.e.
+    /// what the instance actually applied.
+    fn applied_inlet(&self, instance_id: &str) -> f64 {
+        let runtime = if instance_id == INSTANCE {
+            &self.runtime_a
+        } else {
+            &self.runtime_b
+        };
+        match runtime
+            .handle()
+            .snapshot()
+            .values
+            .get(INLET)
+            .cloned()
+            .expect("the snapshot must carry the inlet")
+        {
+            df_core::Value::Float(value) => value,
+            other => panic!("expected Float, got {other:?}"),
+        }
+    }
+}
+
+/// Start two independent engines from the same project and attach both to one
+/// server. `name` scopes the fixture's scratch directory.
+fn start_dual_fixture(name: &str, project: &Path, queue_capacity: usize) -> DualWriteFixture {
+    let dir = std::env::temp_dir().join(format!("df_write_test_{}_{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("cert")).unwrap();
+    std::fs::create_dir_all(dir.join("trusted")).unwrap();
+
+    let port = free_port();
+    let config = secure_config(port, &dir, None);
+
+    let engine_a = load_engine(project).unwrap();
+    let engine_b = load_engine(project).unwrap();
+    let catalogs = vec![
+        InstanceCatalog {
+            instance_id: INSTANCE.into(),
+            tags: engine_a.catalog().to_vec(),
+        },
+        InstanceCatalog {
+            instance_id: SECOND_INSTANCE.into(),
+            tags: engine_b.catalog().to_vec(),
+        },
+    ];
+    let server = OpcUaServer::start_with_catalogs(&config, &catalogs).unwrap();
+
+    let runtime_config = || RuntimeConfig {
+        overrun_policy: OverrunPolicy::Delay,
+        write_queue_capacity: queue_capacity,
+    };
+    let runtime_a = Runtime::start_with_config(engine_a, runtime_config()).unwrap();
+    let runtime_b = Runtime::start_with_config(engine_b, runtime_config()).unwrap();
+    let handles = [
+        (INSTANCE.to_string(), runtime_a.handle()),
+        (SECOND_INSTANCE.to_string(), runtime_b.handle()),
+    ];
+    server.attach_runtimes(&handles).unwrap();
+    let publisher = SnapshotPublisher::start(&server, &handles).unwrap();
+    let index = server.address_space().clone();
+    DualWriteFixture {
+        server,
+        _publisher: publisher,
+        runtime_a,
+        runtime_b,
+        index,
+        endpoint_url: config.endpoint_url.clone(),
+    }
+}
+
+/// Block until the instance has completed `cycles` more cycles, so assertions
+/// after a rejected write cover at least one full cycle boundary.
+fn wait_for_cycles(handle: &RuntimeHandle, cycles: u64) {
+    let start = handle.status().cycle_index;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while handle.status().cycle_index < start + cycles {
+        assert!(Instant::now() < deadline, "the engine must keep cycling");
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -609,6 +724,88 @@ async fn stopped_instances_reject_writes_and_pending_batches_are_discarded() {
     assert!(
         status == opcua::types::StatusCode::BadOutOfService,
         "writes after the stop must be BadOutOfService, got {status:?}"
+    );
+
+    engineer.disconnect().await.unwrap();
+}
+
+/// §8.3: atomicity is per instance, not per OPC UA Write request. One request
+/// carries a valid and an invalid write for instance A and a valid write for
+/// instance B: A's batch is withheld as a whole, B's batch still commits at
+/// its own cycle boundary, and neither instance observes the other's writes.
+#[tokio::test]
+async fn multi_instance_request_vetoes_one_batch_without_blocking_the_other() {
+    let fixture = start_dual_fixture("dual_veto", &two_tank_project(), 256);
+    let engineer = connect_user(
+        "dual_engineer",
+        "engineer",
+        "engineer-pw",
+        &fixture.endpoint_url,
+    )
+    .await;
+    let inlet_a = fixture.tag(INSTANCE, INLET);
+    let level_a = fixture.tag(INSTANCE, LEVEL);
+    let inlet_b = fixture.tag(SECOND_INSTANCE, INLET);
+
+    let results = engineer
+        .write(&[
+            WriteValue {
+                node_id: inlet_a.clone(),
+                attribute_id: AttributeId::Value as u32,
+                index_range: NumericRange::None,
+                value: double_value(0.002),
+            },
+            // Read-only tag of instance A: vetoes only A's batch.
+            WriteValue {
+                node_id: level_a.clone(),
+                attribute_id: AttributeId::Value as u32,
+                index_range: NumericRange::None,
+                value: double_value(0.5),
+            },
+            WriteValue {
+                node_id: inlet_b.clone(),
+                attribute_id: AttributeId::Value as u32,
+                index_range: NumericRange::None,
+                value: double_value(0.003),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert!(
+        results[0] == opcua::types::StatusCode::BadNothingToDo,
+        "instance A's valid write must be withheld with BadNothingToDo, got {:?}",
+        results[0]
+    );
+    assert!(
+        results[1] == opcua::types::StatusCode::BadNotWritable,
+        "instance A's invalid write must report BadNotWritable, got {:?}",
+        results[1]
+    );
+    assert!(
+        results[2].is_good(),
+        "instance B's valid write must succeed independently, got {:?}",
+        results[2]
+    );
+
+    // B committed at a cycle boundary and the model sees it.
+    wait_for_value(&engineer, &inlet_b, 0.003).await;
+
+    // A's batch was not partially applied: after two more of A's own cycles
+    // the engine-level value is still the initial one.
+    wait_for_cycles(&fixture.runtime_a.handle(), 2);
+    assert!(
+        (fixture.applied_inlet(INSTANCE) - INITIAL_INLET).abs() < 1e-9,
+        "instance A must not partially apply a vetoed batch, got {}",
+        fixture.applied_inlet(INSTANCE)
+    );
+    wait_for_value(&engineer, &inlet_a, INITIAL_INLET).await;
+
+    // And B's write did not leak into A (independence in both directions).
+    assert!(
+        (fixture.applied_inlet(SECOND_INSTANCE) - 0.003).abs() < 1e-9,
+        "instance B must keep its own value, got {}",
+        fixture.applied_inlet(SECOND_INSTANCE)
     );
 
     engineer.disconnect().await.unwrap();
