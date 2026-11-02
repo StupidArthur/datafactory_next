@@ -520,6 +520,85 @@ export: {default_columns: [boom]}
 - Starting 窗口 BadWaitingForInitialData、ServerStatus State 聚合等遗留边界沿用 R7 记录。
 - 环境说明：全部 cargo 命令以 `CARGO_TARGET_DIR=D:\cargo_target_df` 在 D: 盘构建（会话环境变量，未改仓库配置）。
 
+## 2026-11-02：R8 修正与验收（Windows 路径表示 / 实例级批次边界）
+
+本轮修正 R8 的两个阻塞项：CI 上 Windows 的 3 个配置路径测试失败，以及多实例写入按整个请求而非按实例判原子性。R9 未在本轮开始。
+
+### 1. 复现（Windows）
+
+CI 原始断言（run 41399825148，windows-latest）：
+
+```
+left : C:\Users\runneradmin\AppData\Local\Temp\df_runtime_config_7656_opcua_certs_15\./cert/server.der
+right: C:\Users\RUNNER~1\AppData\Local\Temp\df_runtime_config_7656_opcua_certs_15\cert/server.der
+```
+
+两类差异同时存在：`HostConfig::load` 会 canonicalize 配置文件路径，Windows 上把 8.3 短名（`RUNNER~1`）展开为长名（`runneradmin`），而测试期望来自 `std::env::temp_dir()` 的短名形式；另外拼接后残留 `./` 组件。
+
+本地复现方法（本机 `Administrator` 目录没有 8.3 短名，故人为构造混合短名根）：
+
+1. 新建目录 `...\Temp\opencode\df_repro_long_component_name`，用 `GetShortPathNameW` 取到其短名 `...\Temp\opencode\DF_REP~1`。
+2. 设 `TMP`/`TEMP` 为该短名路径后运行 `cargo test -p df-runtime --lib config::tests`。
+
+复现结果：与 CI 完全一致的 3 个测试失败、同样的两类断言差异（`df_repro_long_component_name` vs `DF_REP~1`、`\./`）。
+
+```
+test config::tests::relative_paths_resolve_against_config_dir_not_cwd ... FAILED
+test config::tests::opcua_cert_paths_resolve_against_config_dir ... FAILED
+test config::tests::valid_config_uses_declared_and_default_values ... FAILED
+test result: FAILED. 25 passed; 3 failed
+```
+
+### 2. R8-A：路径解析修正
+
+- `resolve_relative` 拼接后去掉 `.` 组件（`drop_cur_dir`），`project: ./x.yaml` 解析为 `<配置目录>\x.yaml`；`..` 保持原样——按字面消解 `..` 会在跨符号链接时改变语义。相对路径基准仍是配置文件所在目录，未改为进程 cwd。
+- 测试期望改为从 canonicalize 后的临时目录构造，与加载器使用同一路径表示；并在 `relative_paths_resolve_against_config_dir_not_cwd` 新增“解析结果不含 `.` 组件”断言（属于加强而非放宽断言）。
+- 验证（Windows 本地）：
+
+```
+cargo fmt --all -- --check                      → 通过
+cargo test -p df-runtime --lib config::tests    → 28 passed / 0 failed
+（短名 TMP=...\DF_REP~1 环境下复验）              → 28 passed / 0 failed
+cargo test -p df-runtime                        → 62 + 2 + 2 passed / 0 failed
+```
+
+### 3. R8-B：实例级批次边界
+
+- `WriteRejection` 新增 `instance_id`：目标为已知 Tag 时携带其实例 id；未知节点、host-owned 节点（Status/非 Value 属性）不携带，因此不否决任何批次。
+- `handle_write` 改为：先逐项校验；任一实例的 Tag 被拒时，仅该实例的合法项置 `BadNothingToDo` 且整批不入队；其他实例各自提交并在自己的周期边界等待确认。跨实例事务原子性仍不承诺。
+- 同实例原子性未变：`rejection_matrix_enforces_catalog_identity_and_atomicity` 中 A 内“合法+非法”混合批次仍整批拒绝。
+- 新增集成测试 `multi_instance_request_vetoes_one_batch_without_blocking_the_other`（tests/opcua_write.rs）：一个真实 Write 请求覆盖 `tank-a` 合法写 + `tank-a` 只读 Tag + `tank-b` 合法写；断言 A 合法项 `BadNothingToDo`、A 非法项 `BadNotWritable`、B `Good`；随后经发布链读到 B=0.003，A 再跑 2 个周期后引擎快照仍为初值 0.0012，且 B 的值不泄漏到 A。
+- 回退复验（证明测试确实覆盖缺陷）：`git stash push -- crates/df-runtime/src/opcua/write.rs` 后运行该测试，旧代码失败：
+
+```
+thread 'multi_instance_request_vetoes_one_batch_without_blocking_the_other' panicked at crates\df-runtime\tests\opcua_write.rs:785:5:
+instance B's valid write must succeed independently, got BadNothingToDo
+test result: FAILED. 0 passed; 1 failed
+```
+
+- 验证（Windows 本地）：
+
+```
+cargo test -p df-runtime --features opcua --lib opcua::write::tests  → 9 passed / 0 failed
+cargo test -p df-runtime --features opcua --test opcua_write         → 5 passed / 0 failed（约 15 s）
+cargo test --workspace --locked                                      → 91 passed / 0 failed
+  （19 df-core + 3 rust_sdk + 62 df-runtime lib + 2 host_config + 2 cli + 3 df-sdk）
+```
+
+### 4. CI（默认 feature）
+
+GitHub Actions [Rust CI #41417657194](https://github.com/StupidArthur/datafactory_next/actions/runs/41417657194)，commit `c545651`：
+
+- ubuntu-latest：通过（42 s）。
+- windows-latest：通过（1 m 34 s）；日志中 `config::tests::relative_paths_resolve_against_config_dir_not_cwd`、`config::tests::opcua_cert_paths_resolve_against_config_dir`、`config::tests::valid_config_uses_declared_and_default_values` 均为 `ok`。
+
+### 5. 边界说明（本轮未覆盖）
+
+- **CI 不覆盖 OPC UA feature**：工作流只执行默认 feature 的 `cargo test --workspace --locked`，未启用 `opcua`。因此上面 R8-B 的双实例集成测试属于**本地验证证据**，不能表述为“CI 已覆盖 R8-B”。Windows CI 只证明默认构建/测试（含 3 个路径测试）通过。
+- 客户端通过 OPC UA 查询超时写入最终状态仍为后续增强；本轮未新增诊断节点/查询服务（R8-C 边界不变）。`BadTimeout` 依旧表示结果不确定。
+- 本轮未运行约 62 秒的完整 `--features opcua` 测试电池，只运行了 `opcua::write::tests` 与 `tests/opcua_write.rs` 两个聚焦目标。
+- 取消路径、UA-02 Browse、UA-05 客户端矩阵等边界沿用上文 R8 记录，归 R9 或后续轮次。
+
 
 
 

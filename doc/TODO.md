@@ -430,6 +430,17 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
 - [~] 边界：BadOutOfService 独立判定仅 Writer over SignAndEncrypt 可达（匿名/Reader 在 SEC-04 先被拒），由 write.rs 单元测试覆盖；取消路径（§8.5.3）——OPC UA 标准 Write 无取消语义，处理器未暴露取消入口，`WriteTicket::cancel` 的 Queued-only 取消语义由 R1 单元测试覆盖；UA-02 Browse 层级与客户端侧完整 UA-05 矩阵归 R9。
 - 证据：`doc/engineering/verification-log.md#2026-11-02-r8-验证`。
 
+### 2026-11-02：R8 修正与验收（Windows 路径表示 / 实例级批次边界）
+
+- [x] 复现：本机无 8.3 短名目录，故用 `GetShortPathNameW` 构造混合短名根（`DF_REP~1`）并以其作为 `TMP`/`TEMP`，运行 `cargo test -p df-runtime --lib config::tests`，复现出与 CI 完全一致的 3 个失败与两类断言差异（loader canonicalize 长名 vs `temp_dir()` 短名、拼接残留 `.` 组件）。
+- [x] R8-A：`resolve_relative` 拼接后去除 `.` 组件（`..` 保留原样，避免跨符号链接语义变化）；测试期望改用与加载器相同的 canonical 路径表示；`relative_paths_resolve_against_config_dir_not_cwd` 新增“解析结果不含 `.` 组件”断言。相对路径基准未变（仍是配置文件目录，不是 cwd）。Windows 本地 + 短名 TMP 环境均 28/28 通过。
+- [x] R8-B：`WriteRejection` 携带已知 Tag 的实例 id；非法 Tag 只否决本实例批次（该实例合法项 `BadNothingToDo` 且不入队），其他实例独立提交并各自等待周期边界；未知/host-owned 节点不否决任何批次。跨实例事务原子性仍不承诺。
+- [x] 新增集成测试 `multi_instance_request_vetoes_one_batch_without_blocking_the_other`（一个真实 Write 请求：A 合法 + A 只读 + B 合法）。回退 `write.rs` 复验时旧代码失败（B 被连坐为 `BadNothingToDo`），修复后通过。
+- [x] 本地测试（Windows，只跑聚焦目标）：`cargo fmt --all -- --check` 通过；`--features opcua --lib opcua::write::tests` 9 通过；`--features opcua --test opcua_write` 5 通过（约 15 s）；`cargo test --workspace --locked` 91 通过 / 0 失败。
+- [x] GitHub Actions #41417657194（commit `c545651`）：ubuntu-latest 42 s、windows-latest 1 m 34 s 均通过；Windows 上 3 个原失败测试均 `ok`。
+- [~] 边界（必须保留）：CI 只执行默认 feature 的 `cargo test --workspace --locked`，**不启用 `opcua` feature**；因此上面的双实例 OPC UA 集成测试是本地验证证据，不能表述为 CI 已覆盖 R8-B。`BadTimeout` 仍表示结果不确定；客户端经 OPC UA 查询超时写入最终状态仍为后续增强，本轮未实现。
+- 证据：`doc/engineering/verification-log.md#2026-11-02-r8-修正与验收windows-路径表示--实例级批次边界`。
+
 
 ## 13. Runtime 系统设计基线
 
@@ -443,7 +454,7 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
   - [x] R5 OPC UA 库 PoC、Endpoint 与安全配置。（2026-11-02，见 §12 R5 验证记录）
   - [x] R6 Tag Catalog → NodeId/Variant/AccessLevel 映射。（2026-11-02，见 §12 R6 验证记录）
   - [x] R7 Snapshot 周期发布与订阅通知。（2026-11-02，见 §12 R7 验证记录；含 R1 停机协议顺序修复）
-  - [x] R8 OPC UA Write Handler、批次聚合、确认与取消。（2026-11-02，见 §12 R8 验证记录；含 CLI 退出码 4/5 接线与首次真实触发）
+  - [x] R8 OPC UA Write Handler、批次聚合、确认与取消。（2026-11-02，见 §12 R8 验证记录；含 CLI 退出码 4/5 接线与首次真实触发；R8 修正与验收见 §12「R8 修正与验收」）
   - [ ] R9 双水箱闭环案例与独立客户端自动化测试。
   - [ ] R10 Monitor 指标、报警、归档。
 
