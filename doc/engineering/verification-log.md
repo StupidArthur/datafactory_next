@@ -609,7 +609,7 @@ GitHub Actions [Rust CI #41417657194](https://github.com/StupidArthur/datafactor
 
 1. 启动与读取：两个 session 分别读取各自实例的 `plant_inlet_flow` 与 `tank_1.level`；两边初始输入均为 0.0012、初始液位一致。
 2. 写入实例 A：`plant_inlet_flow` ← 0.004，返回 Good（Engine 周期边界确认后），随后经发布链回读 0.004（WR-07 证据链）。
-3. 模型响应：`tank_1.level` 上升到高于初值（CL-01：设定值进入 Engine，输出由模型计算得出）。
+3. 模型响应：`tank_1.level` 上升到高于初值（CL-01：外部过程输入进入 Engine，输出由模型计算得出；完整 PID 设定值链见 R10）。
 4. 非回放：再次写 0.006 并回读 0.006，证明输出跟随当前输入变化（CL-02）。
 5. 实例 B 隔离：
    - 客户端读 B 的 `plant_inlet_flow` 仍为 0.0012；
