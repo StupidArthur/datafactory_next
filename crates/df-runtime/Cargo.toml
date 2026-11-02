@@ -1,0 +1,12 @@
+[package]
+name = "df-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+df-core = { path = "../df-core" }
+
+[[bin]]
+name = "df-runtime"
+path = "src/main.rs"
