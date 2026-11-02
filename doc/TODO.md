@@ -325,13 +325,22 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
 - [x] 环境修复：移除 datafactory-next 目录上误设的 rustup 目录覆盖（stable-x86_64-pc-windows-gnu；其 TDM-GCC 10.3 链接器缺 libgcc_eh 导致无法链接），恢复默认 stable-x86_64-pc-windows-msvc。
 - 证据：`doc/engineering/verification-log.md#2026-11-02-runtime-首轮验证`；命令与输出以该台账为准。
 
+### 2026-11-02：R1 验证（RuntimeHandle / Snapshot revision / 写入请求状态）
+
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test --workspace` 通过：42 个测试全部通过、0 失败、0 警告（df-core 19、df-core/rust_sdk 集成 3、df-runtime 17、df-sdk 3；df-runtime 新增 9 个 R1 测试）。
+- [x] R1 新增测试覆盖：RuntimeHandle 在 Owner 释放后仍可观测并返回 `WaitOutcome::Stopped`；revision 等待的 `Changed`/`Timeout` 语义；写入生命周期 `Queued→Cancelled`（取消后周期继续、不含该写入）、`Queued→Applied`（回执与 request_id 查询一致）、`Queued→Rejected`（记录 1201 错误文本）；停止时排队批次置为 `Rejected` 并回执 `WorkerStopped`、queue_depth 归零；队列满时新批次即时 `Rejected` 且可查询；status 暴露 `snapshot_revision`/`last_cycle_started_at`/`last_cycle_lag`/`queue_depth`；写入登记表容量上限并按最老终态记录修剪。
+- [x] Windows 真实引擎端到端复验：与首轮基线一致（cycle_index=5、simulation_time=2.5s、overrun=0、液位与流量数值逐位一致、优雅停止退出码 0），确认 R1 改动未破坏实时调度。
+- [~] RuntimeHandle 尚无真实外部消费者：OPC UA/HTTP 适配层在 R5–R8 接入，届时通过真实客户端验证 handle 的快照订阅与写入提交路径。
+- 证据：`doc/engineering/verification-log.md#2026-11-02-r1-验证`。
+
 
 ## 13. Runtime 系统设计基线
 
 - [x] 完成 Runtime 多实例与 OPC UA 闭环系统设计文档，明确当前代码基线、目标架构、模块接口、运行时序、写入语义、安全边界、异常处理和分阶段实现顺序。
 - [x] 为配置/CLI、双时间调度、多实例、OPC UA 读取订阅、闭环写入、安全稳定性和性能建立分组验收项。
 - [ ] 按设计文档的 R1–R10 顺序推进实现；每项只有在代码、自动化测试和必要的端到端验证通过后才标记完成。
-  - [ ] R1 RuntimeHandle / Snapshot revision 与变更通知 / 写入请求状态（Queued/Applying/Applied/Rejected/Cancelled）/ 状态指标补齐（queue_depth、周期开始时间与调度延迟）。
+  - [x] R1 RuntimeHandle / Snapshot revision 与变更通知 / 写入请求状态（Queued/Applying/Applied/Rejected/Cancelled）/ 状态指标补齐（queue_depth、周期开始时间与调度延迟）。（2026-11-02，见 §12 R1 验证记录）
   - [ ] R2 Runtime Host 配置结构、严格解析、路径处理与配置预检查（check 命令）。
   - [ ] R3 RuntimeManager 多实例生命周期与故障隔离。
   - [ ] R4 CLI Host 模式（run --config / check）、多实例状态与优雅停止。
