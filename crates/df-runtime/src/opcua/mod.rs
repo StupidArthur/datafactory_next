@@ -1,0 +1,575 @@
+//! OPC UA serving layer for the Runtime Host (design §9).
+//!
+//! R5 scope is the library proof of concept: `OpcUaServer` owns a dedicated
+//! OS thread and a single-threaded tokio runtime (`ServerBuilder` and the
+//! server futures are not `Send`), serves the configured endpoint and exposes
+//! a minimal proof-of-concept address space. R6–R8 replace the PoC nodes with
+//! the Tag Catalog mapping, snapshot publishing and the write handler.
+//!
+//! The `opcua` cargo feature gates this whole module: default builds never
+//! compile or link any OPC UA code (design §9.2).
+
+use std::net::TcpStream;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use opcua::crypto::SecurityPolicy as UaSecurityPolicy;
+use opcua::nodes::{AccessLevel, VariableBuilder};
+use opcua::server::diagnostics::NamespaceMetadata;
+use opcua::server::node_manager::memory::{simple_node_manager, SimpleNodeManager};
+use opcua::server::{
+    Server, ServerBuilder, ServerHandle, ServerUserToken, SubscriptionCache,
+    ANONYMOUS_USER_TOKEN_ID,
+};
+use opcua::types::{DataTypeId, DataValue, MessageSecurityMode, NodeId, StatusCode, Variant};
+use tokio_util::sync::CancellationToken;
+
+use crate::config::{
+    validate_endpoint_url, validate_opcua_security, OpcUaConfig, SecurityMode as HostSecurityMode,
+    SecurityPolicy as HostSecurityPolicy,
+};
+use crate::RuntimeError;
+
+/// Node paths of the proof-of-concept address space, inside the configured
+/// namespace.
+pub mod poc_paths {
+    /// Organizing folder for all Runtime nodes.
+    pub const FOLDER: &str = "DataFactory";
+    /// Published counter, changed via `set_value` from the host thread.
+    pub const COUNTER: &str = "DataFactory/PoC/Counter";
+    /// Read-callback node; every read is answered by a dynamic getter.
+    pub const ECHO: &str = "DataFactory/PoC/Echo";
+    /// Write-callback node; written values are captured and served back.
+    pub const WRITABLE: &str = "DataFactory/PoC/WritableValue";
+}
+
+/// Port used when the endpoint URL omits one (the OPC UA default port).
+pub const DEFAULT_OPC_UA_PORT: u16 = 4840;
+
+/// How long `OpcUaServer::start` waits for the endpoint to accept TCP
+/// connections before the start is reported as failed.
+const TCP_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Username/password credentials accepted by the server in addition to
+/// anonymous access.
+///
+/// R5 proof-of-concept only: the Host configuration gains user definitions
+/// (sourced from environment variables, design §9.1) in R8.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainUserCredentials {
+    pub username: String,
+    pub password: String,
+}
+
+/// Parse `opc.tcp://host[:port][/path]` into a bind host and port. Structural
+/// URL validation is shared with `config.rs`.
+pub(crate) fn parse_endpoint(url: &str) -> Result<(String, u16), RuntimeError> {
+    validate_endpoint_url(url)
+        .map_err(|message| RuntimeError::Config(format!("opcua.endpoint_url {url}: {message}")))?;
+    let rest = url.strip_prefix("opc.tcp://").ok_or_else(|| {
+        RuntimeError::Config(format!(
+            "opcua.endpoint_url {url}: must use the opc.tcp scheme"
+        ))
+    })?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let (host, port) = if authority.starts_with('[') {
+        let close = authority.find(']').ok_or_else(|| {
+            RuntimeError::Config(format!(
+                "opcua.endpoint_url {url}: unterminated IPv6 address"
+            ))
+        })?;
+        let host = authority[1..close].to_string();
+        let port = authority[close + 1..]
+            .strip_prefix(':')
+            .and_then(|text| text.parse::<u16>().ok());
+        (host, port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host.to_string(), port.parse::<u16>().ok()),
+            None => (authority.to_string(), None),
+        }
+    };
+    if host.is_empty() {
+        return Err(RuntimeError::Config(format!(
+            "opcua.endpoint_url {url}: is missing a host"
+        )));
+    }
+    Ok((host, port.unwrap_or(DEFAULT_OPC_UA_PORT)))
+}
+
+fn map_security_mode(mode: HostSecurityMode) -> MessageSecurityMode {
+    match mode {
+        HostSecurityMode::None => MessageSecurityMode::None,
+        HostSecurityMode::Sign => MessageSecurityMode::Sign,
+        HostSecurityMode::SignAndEncrypt => MessageSecurityMode::SignAndEncrypt,
+    }
+}
+
+fn map_security_policy(policy: HostSecurityPolicy) -> UaSecurityPolicy {
+    match policy {
+        HostSecurityPolicy::None => UaSecurityPolicy::None,
+        HostSecurityPolicy::Basic128Rsa15 => UaSecurityPolicy::Basic128Rsa15,
+        HostSecurityPolicy::Basic256 => UaSecurityPolicy::Basic256,
+        HostSecurityPolicy::Basic256Sha256 => UaSecurityPolicy::Basic256Sha256,
+    }
+}
+
+/// Per-server PKI directory. A unique directory per server keeps parallel
+/// servers (tests, multiple instances) from racing on sample certificate
+/// generation; configured trust lists still take precedence.
+fn default_pki_dir() -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = NEXT.fetch_add(1, Ordering::SeqCst);
+    std::env::temp_dir().join(format!("datafactory_pki_{}_{serial}", std::process::id()))
+}
+
+/// Everything the host thread needs from the server thread once the server
+/// has been built.
+struct ServerReady {
+    namespace_index: u16,
+    node_manager: Arc<SimpleNodeManager>,
+    subscriptions: Arc<SubscriptionCache>,
+    stop_token: CancellationToken,
+}
+
+/// Create the server from the Host configuration plus PoC user credentials.
+///
+/// Runs on the OPC UA thread inside the tokio runtime context because
+/// `ServerBuilder::build` creates tokio synchronization primitives.
+fn build_server(
+    config: &OpcUaConfig,
+    users: &[PlainUserCredentials],
+    host: &str,
+    port: u16,
+) -> Result<(Server, ServerHandle, ServerReady), String> {
+    let pki_dir = config
+        .security
+        .trust_list
+        .clone()
+        .unwrap_or_else(default_pki_dir);
+    // Certificate material: use the configured files when present, otherwise
+    // generate a sample keypair into the PKI directory. `create_sample_keypair`
+    // only writes the files when they do not exist yet.
+    let (certificate_path, private_key_path) = match (
+        &config.security.server_certificate,
+        &config.security.server_private_key,
+    ) {
+        (Some(cert), Some(key)) => (Some(cert.clone()), Some(key.clone())),
+        _ => (
+            Some(pki_dir.join("own").join("cert.der")),
+            Some(pki_dir.join("private").join("private.pem")),
+        ),
+    };
+
+    // The configured endpoint. Anonymous access is always advertised for the
+    // R5 proof of concept; user/password tokens are added on top. R8 wires
+    // `allow_anonymous` into a custom authenticator.
+    let mut user_ids = vec![ANONYMOUS_USER_TOKEN_ID.to_string()];
+    for user in users {
+        user_ids.push(user.username.clone());
+    }
+    let user_token_ids: Vec<&str> = user_ids.iter().map(String::as_str).collect();
+
+    let mut builder = ServerBuilder::new()
+        .application_name("DataFactory Runtime")
+        .application_uri(config.application_uri.clone())
+        .product_uri("urn:datafactory:runtime")
+        .create_sample_keypair(true)
+        .trust_client_certs(true)
+        .pki_dir(pki_dir)
+        .certificate_path(certificate_path.unwrap())
+        .private_key_path(private_key_path.unwrap())
+        .host(host.to_string())
+        .port(port)
+        .discovery_urls(vec![config.endpoint_url.clone()])
+        .with_node_manager(simple_node_manager(
+            NamespaceMetadata {
+                namespace_uri: config.namespace_uri.clone(),
+                ..Default::default()
+            },
+            "datafactory",
+        ));
+
+    for user in users {
+        builder = builder.add_user_token(
+            user.username.clone(),
+            ServerUserToken::user_pass(user.username.clone(), user.password.clone()),
+        );
+    }
+
+    builder = builder
+        .add_endpoint(
+            "datafactory",
+            (
+                "/",
+                map_security_policy(config.security.policy),
+                map_security_mode(config.security.mode),
+                user_token_ids.as_slice(),
+            ),
+        )
+        .default_endpoint("datafactory");
+
+    let (server, handle) = builder.build()?;
+    let ready = populate_poc_nodes(&handle, config)?;
+    Ok((server, handle, ready))
+}
+
+/// Populate the R5 proof-of-concept address space and resolve the namespace.
+fn populate_poc_nodes(handle: &ServerHandle, config: &OpcUaConfig) -> Result<ServerReady, String> {
+    let namespace_index = handle
+        .get_namespace_index(&config.namespace_uri)
+        .ok_or_else(|| format!("namespace {} was not registered", config.namespace_uri))?;
+    let node_manager = handle
+        .node_managers()
+        .get_of_type::<SimpleNodeManager>()
+        .ok_or_else(|| "the simple node manager is missing from the server".to_string())?;
+
+    let ns = namespace_index;
+    let folder_id = NodeId::new(ns, poc_paths::FOLDER);
+    let counter_id = NodeId::new(ns, poc_paths::COUNTER);
+    let echo_id = NodeId::new(ns, poc_paths::ECHO);
+    let writable_id = NodeId::new(ns, poc_paths::WRITABLE);
+
+    {
+        let mut space = node_manager.address_space().write();
+        if !space.add_folder(
+            &folder_id,
+            "DataFactory",
+            "DataFactory",
+            &NodeId::objects_folder_id(),
+        ) {
+            return Err("cannot create the DataFactory folder".into());
+        }
+        for (id, name, writable) in [
+            (&counter_id, "Counter", false),
+            (&echo_id, "Echo", false),
+            (&writable_id, "WritableValue", true),
+        ] {
+            let mut builder = VariableBuilder::new(id, name, name)
+                .organized_by(&folder_id)
+                // async-opcua 0.19 does not infer the data type from the
+                // builder value, and an invalid variable panics on insert.
+                .data_type(DataTypeId::Double)
+                .value(0.0f64);
+            if writable {
+                // Publisher nodes stay read-only; actuator nodes accept
+                // client writes (the write callback intercepts them).
+                builder = builder
+                    .user_access_level(AccessLevel::CURRENT_READ | AccessLevel::CURRENT_WRITE);
+            }
+            if !builder.insert(&mut *space) {
+                return Err(format!("cannot create the {name} variable"));
+            }
+        }
+    }
+
+    // Echo: served entirely by a dynamic read callback.
+    node_manager
+        .inner()
+        .add_read_callback(echo_id, |_, _, _| Ok(DataValue::new_now(42.0f64)));
+
+    // WritableValue: a registered write callback intercepts every write, so
+    // SimpleNodeManager does not store the value in the address space itself.
+    // The callback records the value and a read callback serves it back. R8
+    // replaces this with `RuntimeHandle::submit_writes`.
+    let written: Arc<Mutex<Option<Variant>>> = Arc::new(Mutex::new(None));
+    let writer = Arc::clone(&written);
+    node_manager
+        .inner()
+        .add_write_callback(writable_id.clone(), move |value: DataValue, _| {
+            *writer.lock().unwrap() = Some(value.value.unwrap_or(Variant::Empty));
+            StatusCode::Good
+        });
+    node_manager
+        .inner()
+        .add_read_callback(writable_id, move |_, _, _| {
+            let stored = written.lock().unwrap().clone();
+            Ok(DataValue::new_now(stored.unwrap_or(Variant::Double(0.0))))
+        });
+
+    Ok(ServerReady {
+        namespace_index,
+        node_manager,
+        subscriptions: handle.subscriptions().clone(),
+        stop_token: handle.token().clone(),
+    })
+}
+
+/// A running OPC UA server owned by the Runtime Host.
+///
+/// The server runs on a dedicated OS thread with its own single-threaded
+/// tokio runtime. `stop` cancels the server token; `run` observes it and
+/// shuts the server down gracefully.
+pub struct OpcUaServer {
+    endpoint_url: String,
+    namespace_index: u16,
+    node_manager: Arc<SimpleNodeManager>,
+    subscriptions: Arc<SubscriptionCache>,
+    stop_token: CancellationToken,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl OpcUaServer {
+    /// Start the OPC UA server described by `config`.
+    pub fn start(config: &OpcUaConfig) -> Result<Self, RuntimeError> {
+        Self::start_with_users(config, &[])
+    }
+
+    /// Start the server with additional username/password credentials.
+    ///
+    /// The §9.1 security rules are re-checked here at start time.
+    pub fn start_with_users(
+        config: &OpcUaConfig,
+        users: &[PlainUserCredentials],
+    ) -> Result<Self, RuntimeError> {
+        if !config.enabled {
+            return Err(RuntimeError::Config("opcua service is not enabled".into()));
+        }
+        validate_opcua_security(config)?;
+        let (host, port) = parse_endpoint(&config.endpoint_url)?;
+        let endpoint_url = config.endpoint_url.clone();
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<ServerReady, String>>();
+        let finished = Arc::new(AtomicBool::new(false));
+        let run_error = Arc::new(Mutex::new(None::<String>));
+
+        let thread_config = config.clone();
+        let thread_users = users.to_vec();
+        let thread_host = host.clone();
+        let thread_finished = Arc::clone(&finished);
+        let thread_run_error = Arc::clone(&run_error);
+
+        let thread = std::thread::Builder::new()
+            .name("df-opcua-server".into())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(format!("cannot build tokio runtime: {error}")));
+                        return;
+                    }
+                };
+                runtime.block_on(async move {
+                    let built = build_server(&thread_config, &thread_users, &thread_host, port);
+                    let (server, _handle, ready) = match built {
+                        Ok(built) => built,
+                        Err(message) => {
+                            let _ = ready_tx.send(Err(message));
+                            thread_finished.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                    };
+
+                    // Bind before signalling readiness, so a bind failure
+                    // (e.g. the port is already taken) is reported as a
+                    // start error instead of a probe timeout.
+                    let listener = match tokio::net::TcpListener::bind((thread_host.as_str(), port))
+                        .await
+                    {
+                        Ok(listener) => listener,
+                        Err(error) => {
+                            let _ = ready_tx
+                                .send(Err(format!("cannot bind {thread_host}:{port}: {error}")));
+                            thread_finished.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                    };
+
+                    if ready_tx.send(Ok(ready)).is_err() {
+                        // `start` gave up; do not run the server.
+                        return;
+                    }
+
+                    // `run_with` observes the server token internally and
+                    // shuts down gracefully when it is cancelled.
+                    let result = server.run_with(listener).await;
+                    if let Err(message) = result {
+                        *thread_run_error.lock().unwrap() = Some(message);
+                    }
+                    thread_finished.store(true, Ordering::SeqCst);
+                });
+            })
+            .map_err(|error| {
+                RuntimeError::Config(format!("cannot spawn the opcua thread: {error}"))
+            })?;
+
+        let ready = match ready_rx.recv_timeout(Duration::from_secs(120)) {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = thread.join();
+                return Err(RuntimeError::Config(
+                    "opcua server thread exited before the endpoint became ready".into(),
+                ));
+            }
+        };
+        let ready = match ready {
+            Ok(ready) => ready,
+            Err(message) => {
+                let _ = thread.join();
+                return Err(RuntimeError::Config(format!(
+                    "opcua server failed to start: {message}"
+                )));
+            }
+        };
+
+        // Confirm the endpoint accepts TCP connections before reporting
+        // success. A runtime failure after readiness surfaces as `finished`
+        // plus `run_error` (this feeds the CLI exit code 4 in R8).
+        let probe_deadline = Instant::now() + TCP_PROBE_TIMEOUT;
+        loop {
+            if finished.load(Ordering::SeqCst) {
+                let _ = thread.join();
+                let message = run_error
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "opcua server stopped unexpectedly".into());
+                return Err(RuntimeError::Config(format!(
+                    "opcua server failed to start: {message}"
+                )));
+            }
+            if TcpStream::connect((host.as_str(), port)).is_ok() {
+                break;
+            }
+            if Instant::now() >= probe_deadline {
+                ready.stop_token.cancel();
+                let _ = thread.join();
+                return Err(RuntimeError::Config(format!(
+                    "opcua endpoint {endpoint_url} did not accept connections within {}s",
+                    TCP_PROBE_TIMEOUT.as_secs()
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        Ok(Self {
+            endpoint_url,
+            namespace_index: ready.namespace_index,
+            node_manager: ready.node_manager,
+            subscriptions: ready.subscriptions,
+            stop_token: ready.stop_token,
+            thread: Some(thread),
+        })
+    }
+
+    /// The configured endpoint URL.
+    pub fn endpoint_url(&self) -> &str {
+        &self.endpoint_url
+    }
+
+    /// Namespace index assigned to the configured `namespace_uri`.
+    pub fn namespace_index(&self) -> u16 {
+        self.namespace_index
+    }
+
+    /// The simple node manager backing the address space.
+    pub fn node_manager(&self) -> &Arc<SimpleNodeManager> {
+        &self.node_manager
+    }
+
+    /// Subscription cache used to notify monitoring clients.
+    pub fn subscriptions(&self) -> &Arc<SubscriptionCache> {
+        &self.subscriptions
+    }
+
+    /// Node id of a proof-of-concept node in the server namespace.
+    pub fn poc_node_id(&self, path: &str) -> NodeId {
+        NodeId::new(self.namespace_index, path)
+    }
+
+    /// Stop the server and wait for its thread to exit. Idempotent.
+    pub fn stop(&mut self) {
+        self.stop_token.cancel();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for OpcUaServer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_endpoint_handles_host_port_and_ipv6() {
+        assert_eq!(
+            parse_endpoint("opc.tcp://127.0.0.1:4840").unwrap(),
+            ("127.0.0.1".to_string(), 4840)
+        );
+        assert_eq!(
+            parse_endpoint("opc.tcp://localhost").unwrap(),
+            ("localhost".to_string(), DEFAULT_OPC_UA_PORT)
+        );
+        assert_eq!(
+            parse_endpoint("opc.tcp://[::1]:50000/Path").unwrap(),
+            ("::1".to_string(), 50000)
+        );
+        assert_eq!(
+            parse_endpoint("opc.tcp://192.168.1.5:9").unwrap(),
+            ("192.168.1.5".to_string(), 9)
+        );
+        // Errors
+        assert!(parse_endpoint("http://127.0.0.1:4840").is_err());
+        assert!(parse_endpoint("opc.tcp://:4840").is_err());
+        assert!(parse_endpoint("opc.tcp://host:notaport").is_err());
+        assert!(parse_endpoint("opc.tcp://[::1:4840").is_err());
+    }
+
+    #[test]
+    fn start_rejects_disabled_and_insecure_config() {
+        // Disabled config is rejected outright.
+        let mut config = OpcUaConfig {
+            enabled: false,
+            endpoint_url: "opc.tcp://127.0.0.1:48400".into(),
+            application_uri: "urn:datafactory:runtime".into(),
+            namespace_uri: "urn:datafactory:runtime:ns".into(),
+            security: Default::default(),
+        };
+        assert!(matches!(
+            OpcUaServer::start(&config),
+            Err(RuntimeError::Config(message)) if message.contains("not enabled")
+        ));
+
+        // A programmatic non-loopback config cannot bypass the §9.1 rules.
+        config.enabled = true;
+        config.endpoint_url = "opc.tcp://0.0.0.0:48400".into();
+        assert!(matches!(
+            OpcUaServer::start(&config),
+            Err(RuntimeError::Config(message)) if message.contains("non-loopback")
+        ));
+    }
+
+    #[test]
+    fn start_fails_cleanly_when_the_port_is_taken() {
+        // Occupy a port, then try to start a server on it: the bind failure
+        // must surface as a clean start error instead of reporting success.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = OpcUaConfig {
+            enabled: true,
+            endpoint_url: format!("opc.tcp://127.0.0.1:{port}"),
+            application_uri: "urn:datafactory:runtime".into(),
+            namespace_uri: "urn:datafactory:runtime:ns".into(),
+            security: Default::default(),
+        };
+        let error = match OpcUaServer::start(&config) {
+            Err(error) => error,
+            Ok(_) => panic!("starting on an occupied port must fail"),
+        };
+        assert!(error.to_string().contains("failed to start"), "{error}");
+        // The bind failure is reported and the thread has exited.
+        drop(listener);
+    }
+}

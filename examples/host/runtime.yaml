@@ -7,7 +7,7 @@ opcua:
   enabled: false
   endpoint_url: "opc.tcp://127.0.0.1:4840"
   application_uri: "urn:datafactory:runtime"
-  namespace_uri: "urn:datafactory:runtime"
+  namespace_uri: "urn:datafactory:runtime:ns"
   security:
     mode: None
     policy: None

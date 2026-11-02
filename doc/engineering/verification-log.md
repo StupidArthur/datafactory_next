@@ -253,5 +253,62 @@ run --config（全部启用实例启动失败）: "all enabled instances failed 
 
 - 注册表锁边界（§5.2「模型执行不持有注册表锁」）由实现结构保证（锁只在查找/簿记时持有，加载与执行在锁外），未构造并发压力场景专项测试。
 
+## 2026-11-02：R5 验证（OPC UA 库 PoC / Endpoint 与安全配置 / §9.1）
+
+范围：`crates/df-runtime` 新增 `src/opcua/mod.rs`（`opcua` feature 门控）与 `tests/opcua_poc.rs`（required-features 门控）；`config.rs` 新增 §9.1 安全校验与 URI 约束（`validate_opcua_security`/`endpoint_host`/`is_loopback_host`）；`Cargo.toml` 新增 `opcua` feature（async-opcua 0.19 + tokio + tokio-util）并注册 `opcua_poc` 测试目标；`src/lib.rs` feature 接线。
+
+### 1. 格式与测试
+
+```text
+命令: cargo fmt --all -- --check
+结果: 通过（退出码 0）
+
+命令: cargo test -p df-runtime --features opcua
+结果: 全部目标 0 failed
+
+test result: ok. 60 passed; 0 failed  — df-runtime 单元测试（默认 57 + opcua 模块 3）
+test result: ok. 2 passed; 0 failed   — df-runtime bin cli 参数解析测试
+test result: ok. 2 passed; 0 failed   — df-runtime host_config 集成测试
+test result: ok. 2 passed; 0 failed   — df-runtime opcua_poc 集成测试
+小计: 66 passed / 0 failed
+
+命令: cargo test --workspace（默认构建，无 opcua feature）
+结果: 通过（退出码 0，无警告）
+
+test result: ok. 19 passed; 0 failed  — df-core 单元测试
+test result: ok. 3 passed; 0 failed   — df-core Rust SDK 集成测试
+test result: ok. 57 passed; 0 failed  — df-runtime 单元测试（R4 后 51 + R5 新增 6 个 config 测试）
+test result: ok. 2 passed; 0 failed   — df-runtime host_config 集成测试
+test result: ok. 2 passed; 0 failed   — df-runtime bin cli 参数解析测试
+test result: ok. 3 passed; 0 failed   — df-sdk 单元测试
+合计: 86 passed / 0 failed
+```
+
+### 2. R5 PoC 覆盖点（tests/opcua_poc.rs，2 个集成测试）
+
+- `anonymous_poc_connect_read_write_and_subscription`：匿名 + SecurityPolicy None 连接回环端点；读取 Counter 初始 0.0 与 Echo 动态读回调 42.0；主机线程 `set_value`（SimpleNodeManager + SubscriptionCache，即 R7 发布路径）后客户端读到 7.0；客户端订阅（100ms 发布间隔）收到 set_value 的 9.0 通知；客户端写 WritableValue 返回 Good、被写回调捕获并由读回调回读 3.5；`stop()` 幂等且停止后端口可重新绑定。
+- `secure_channel_with_username_password_auth`：SignAndEncrypt + Basic256Sha256，证书/私钥路径缺省时由服务器在配置路径生成样例密钥对（测试断言文件生成）；`start_with_users` 注册 engineer 用户；正确口令会话激活并通过加密通道读到 Echo=42.0；错误口令会话在 3 秒超时内无法激活。
+
+### 3. §9.1 配置策略与库行为约束（config.rs + opcua/mod.rs，新增 6 个 config 测试 + 3 个 opcua 模块测试）
+
+- endpoint_url serde 缺省 `opc.tcp://127.0.0.1:4840`（`endpoint_url_defaults_to_loopback`）；`endpoint_url_validation_matrix`/`loopback_host_matrix` 覆盖 IPv6 字面量、路径、端口缺省等解析。
+- 非回环端点（0.0.0.0 / 192.168.1.10 / [2001:db8::1]）+ mode/policy None → 拒绝（`non_loopback_unsecured_endpoint_is_rejected`）；+ allow_anonymous → 拒绝（`non_loopback_anonymous_endpoint_is_rejected`）；+ SignAndEncrypt/Basic256Sha256/非匿名 → 接受（`non_loopback_secure_non_anonymous_endpoint_is_accepted`）。`0.0.0.0` 刻意不视为回环。
+- 库约束发现并固化为校验：async-opcua 0.19 内置诊断节点管理器在 build 时以 application_uri 注册命名空间并独占其 owns_node 路由，application_uri == namespace_uri 时自有节点读取返回 value=None → `validate_opcua_security` 强制二者不同（`opcua_uris_must_differ`，禁用段跳过）；设计文档 §4.1/§7.3、`examples/host/runtime.yaml` 与全部测试夹具同步拆分（namespace 用 `urn:datafactory:runtime:ns`）。
+- 校验在配置加载与 `OpcUaServer::start` 两处共用：程序化构造且 enabled 的非回环配置在 start 处同样被拒（`start_rejects_disabled_and_insecure_config`）。
+
+### 4. 服务器生命周期与依赖隔离
+
+- `OpcUaServer::start`：专用 OS 线程 + current_thread tokio runtime（ServerBuilder/服务器 future 非 Send）；服务器 build 后先绑定 tokio TcpListener 再发送 ready——端口占用（专项测试 `start_fails_cleanly_when_the_port_is_taken`）在启动阶段同步报 "failed to start"，而非探测超时；ready 后宿主线程 TCP 探测确认端点可接受连接；`run_with` 内部监听取消 token，`stop()` 取消 + join 线程，Drop 兜底调用。
+- 实现约束记录：VariableBuilder 必须显式 `.data_type(DataTypeId::Double)`（0.19 不从 builder value 推断，缺失时 insert 即 panic "The node is not valid"）；0.19 写回调拦截后不落盘，须配对读回调回写状态；`wait_for_connection` 在激活失败时挂起，负向认证测试必须用 timeout 包裹；默认 user_access_level 仅 CURRENT_READ，可写节点须显式 `CURRENT_READ | CURRENT_WRITE`。
+- 依赖隔离（§9.2）：`cargo tree -p df-runtime`（默认）无 async-opcua/tokio/tokio-util；`--features opcua` 时三者全部出现——默认构建零 OPC UA 依赖成立。
+
+### 5. 边界说明（未验证项）
+
+- PoC 地址空间（DataFactory/PoC/{Counter,Echo,WritableValue}）为临时验证节点；Tag Catalog → NodeId 映射（R6）、快照周期发布（R7）、UA 写处理器 → `RuntimeHandle::submit_writes` 与 allow_anonymous 认证器及用户配置（R8）随后接入。
+- 退出码 4（OPC UA 启动失败）的 CLI 接线在 R8；绑定失败检测路径已就绪（ready 阶段同步报错）。
+- `default_pki_dir`（临时目录 + pid + 序号）仅为无证书配置的样例密钥对落盘目录；正式部署应显式配置证书路径与 trust_list，生产信任链验证归 R8 部署配置。
+- 环境说明：G: 盘构建空间不足（曾到 0 空闲），`cargo clean` 回收 4.7 GB 后全部 cargo 命令以 `CARGO_TARGET_DIR=D:\cargo_target_df` 在 D: 盘构建（会话环境变量，未改仓库配置）。
+
+
 
 

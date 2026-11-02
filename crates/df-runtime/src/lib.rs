@@ -14,6 +14,9 @@ mod loader;
 mod manager;
 mod runtime_handle;
 
+#[cfg(feature = "opcua")]
+pub mod opcua;
+
 pub use config::{
     HostConfig, InstanceConfig, OpcUaConfig, OpcUaSecurityConfig, SchedulerConfig, SecurityMode,
     SecurityPolicy,

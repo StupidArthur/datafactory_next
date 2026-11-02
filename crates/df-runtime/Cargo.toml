@@ -9,6 +9,20 @@ df-core = { path = "../df-core" }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 
+# OPC UA serving layer (design §9.2). Kept strictly optional: default builds
+# never compile or link any OPC UA code; enable with `--features opcua`.
+async-opcua = { version = "0.19", features = ["server", "client"], optional = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "macros"], optional = true }
+tokio-util = { version = "0.7", optional = true }
+
+[features]
+default = []
+opcua = ["dep:async-opcua", "dep:tokio", "dep:tokio-util"]
+
 [[bin]]
 name = "df-runtime"
 path = "src/main.rs"
+
+[[test]]
+name = "opcua_poc"
+required-features = ["opcua"]

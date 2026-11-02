@@ -374,6 +374,20 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
 - [~] 退出码 4（OPC UA 启动失败）与运行中退出 5 的真实触发在 R5–R8 随 OPC UA 服务接入后验证。
 - 证据：`doc/engineering/verification-log.md#2026-11-02-r4-验证`。
 
+### 2026-11-02：R5 验证（OPC UA 库 PoC / Endpoint 与安全配置 / §9.1）
+
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test -p df-runtime --features opcua` 通过：66 个测试全部通过、0 失败（df-runtime lib 60 = 默认 57 + opcua 模块 3、bin cli 2、host_config 2、opcua_poc 2）。
+- [x] `cargo test --workspace`（默认构建，不含 opcua feature）通过：86 个测试全部通过、0 失败、0 警告（df-core 19、rust_sdk 3、df-runtime lib 57（R5 新增 6 个 config 测试）、host_config 2、cli 2、df-sdk 3）。
+- [x] PoC 集成测试（opcua_poc，2 个）：匿名 + None 策略连接，读取初始 Counter、Echo 动态读回调（42.0）、主机线程 set_value 后可读（跨线程发布路径，R7 的基础）、客户端订阅收到 set_value 更新、客户端写被写回调捕获并回读（SimpleNodeManager 不落盘回调写入）、stop 后端口可重新绑定、stop 幂等；SignAndEncrypt + Basic256Sha256 以配置路径生成密钥对，用户名/密码认证正反两向（错误口令 3 秒内无法激活会话）。
+- [x] §9.1 配置策略（config.rs，新增 7 个测试）：endpoint_url serde 默认 `opc.tcp://127.0.0.1:4840`；非回环端点 + mode/policy None → 配置错误；非回环端点 + allow_anonymous → 配置错误；非回环 + 加密 + 非匿名 → 接受；回环判定矩阵（localhost/127.0.0.0/8/::1 通过，0.0.0.0/局域网 IP/全局 IPv6/域名拒绝，0.0.0.0 刻意不算回环）；校验由 `validate_opcua_security` 在配置加载时与 `OpcUaServer::start` 启动时共用，程序化构造的 `OpcUaConfig` 无法绕过。
+- [x] 库行为约束发现并固化为校验规则：async-opcua 0.19 内置诊断节点管理器以 application_uri 注册命名空间并独占其节点路由，application_uri 与 namespace_uri 相同时自有节点读取为空（value=None）→ `validate_opcua_security` 强制二者不同；设计文档 §4.1/§7.3、示例夹具与全部测试同步拆分（namespace 用 `urn:datafactory:runtime:ns`）。另一实现约束：VariableBuilder 必须显式 `.data_type(DataTypeId::Double)`，否则节点插入即 panic（0.19 不从 builder value 推断数据类型）。
+- [x] 服务器生命周期（opcua/mod.rs，3 个单元测试 + PoC 覆盖）：专用 OS 线程 + current_thread tokio runtime（ServerBuilder 非 Send）；ready 消息前先绑定 tokio TcpListener，端口占用在 ready 阶段同步干净失败（专项测试占用端口启动必失败）；ready 后 TCP 探测确认端点可接受连接（为 R8 退出码 4 提供检测路径）；stop() 取消 token + join 线程，幂等，Drop 调 stop。
+- [x] 依赖隔离（§9.2）：`cargo tree -p df-runtime`（默认）无 async-opcua/tokio/tokio-util；`--features opcua` 时三者全部出现。opcua 模块与 opcua_poc 测试目标均以 required-features 门控。
+- [x] 环境说明：G: 盘构建空间不足（曾到 0 空闲），`cargo clean` 回收 4.7 GB 后，全部 cargo 命令通过 `CARGO_TARGET_DIR=D:\cargo_target_df` 在 D: 盘构建（会话环境变量，未改配置文件）。
+- [~] PoC 节点为临时地址空间（DataFactory/PoC/{Counter,Echo,WritableValue}）：Tag Catalog → NodeId 映射（R6）、快照周期发布（R7）、写处理器与 allow_anonymous 认证器及用户配置（R8）随后接入；退出码 4 的 CLI 接线在 R8 验证。
+- 证据：`doc/engineering/verification-log.md#2026-11-02-r5-验证`。
+
 
 ## 13. Runtime 系统设计基线
 
@@ -384,7 +398,7 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
   - [x] R2 Runtime Host 配置结构、严格解析、路径处理与配置预检查（check 命令）。（2026-11-02，check CLI 接线归 R4）
   - [x] R3 RuntimeManager 多实例生命周期与故障隔离。（2026-11-02，多实例 CLI 入口归 R4）
   - [x] R4 CLI Host 模式（run --config / check）、多实例状态与优雅停止。（2026-11-02）
-  - [ ] R5 OPC UA 库 PoC、Endpoint 与安全配置。
+  - [x] R5 OPC UA 库 PoC、Endpoint 与安全配置。（2026-11-02，见 §12 R5 验证记录）
   - [ ] R6 Tag Catalog → NodeId/Variant/AccessLevel 映射。
   - [ ] R7 Snapshot 周期发布与订阅通知。
   - [ ] R8 OPC UA Write Handler、批次聚合、确认与取消。

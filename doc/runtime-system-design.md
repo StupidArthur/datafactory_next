@@ -177,7 +177,9 @@ opcua:
   enabled: true
   endpoint_url: "opc.tcp://127.0.0.1:4840"
   application_uri: "urn:datafactory:runtime"
-  namespace_uri: "urn:datafactory:runtime"
+  # namespace_uri 必须与 application_uri 不同：async-opcua 0.19 的内置诊断节点
+  # 管理器以 application_uri 注册命名空间并独占其路由，相同 URI 会导致自有节点不可读。
+  namespace_uri: "urn:datafactory:runtime:ns"
   security:
     mode: SignAndEncrypt
     policy: Basic256Sha256
@@ -431,7 +433,8 @@ Objects
 
 ### 7.3 Namespace 与 NodeId
 
-- Namespace URI 使用固定值，例如 `urn:datafactory:runtime`。
+- Namespace URI 使用固定值，例如 `urn:datafactory:runtime:ns`。
+- Namespace URI 必须与 `application_uri` 不同：async-opcua 0.19 的内置诊断节点管理器以 application_uri 注册命名空间并独占其节点路由，两个 URI 相同会导致自有节点读取返回空值（R5 实测发现，已固化为配置校验规则）。
 - NodeId 使用字符串标识，包含实例 ID 和完整 Tag 名称。
 - 建议格式：`df/instances/{instance_id}/tags/{percent_encoded_tag_name}`。
 - 实例状态节点使用 `df/instances/{instance_id}/status/{status_name}`。

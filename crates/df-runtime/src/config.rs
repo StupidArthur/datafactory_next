@@ -125,11 +125,18 @@ struct RawHostConfig {
 struct RawOpcUaConfig {
     #[serde(default = "default_true")]
     enabled: bool,
+    #[serde(default = "default_endpoint_url")]
     endpoint_url: String,
     application_uri: String,
     namespace_uri: String,
     #[serde(default)]
     security: RawOpcUaSecurityConfig,
+}
+
+/// Design §9.1: the endpoint defaults to the loopback interface, so an
+/// unconfigured Host never exposes anything beyond the local machine.
+fn default_endpoint_url() -> String {
+    "opc.tcp://127.0.0.1:4840".to_string()
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -328,14 +335,55 @@ impl RawOpcUaConfig {
             }
         }
 
-        Ok(OpcUaConfig {
+        let opcua = OpcUaConfig {
             enabled: self.enabled,
             endpoint_url: self.endpoint_url,
             application_uri: self.application_uri,
             namespace_uri: self.namespace_uri,
             security,
-        })
+        };
+        if opcua.enabled {
+            validate_opcua_security(&opcua)?;
+        }
+        Ok(opcua)
     }
+}
+
+/// Design §9.1 security rules for a resolved OPC UA configuration: outside
+/// the loopback interface, serving must be encrypted and must not allow
+/// anonymous access. Also enforces the namespace-ownership invariant:
+/// `application_uri` and `namespace_uri` must differ, because the built-in
+/// diagnostics node manager claims the application URI namespace and would
+/// capture reads for our nodes.
+///
+/// Used both when the Host configuration is loaded and again by the OPC UA
+/// serving layer at server start, so a programmatically built `OpcUaConfig`
+/// that never passed through `HostConfig::load` cannot bypass the rules.
+pub(crate) fn validate_opcua_security(config: &OpcUaConfig) -> Result<(), RuntimeError> {
+    if config.application_uri == config.namespace_uri {
+        return Err(RuntimeError::Config(
+            "opcua: application_uri and namespace_uri must differ; the application URI namespace is owned by the server diagnostics"
+                .into(),
+        ));
+    }
+    let host = endpoint_host(&config.endpoint_url).unwrap_or_default();
+    if !is_loopback_host(&host) {
+        if config.security.mode == SecurityMode::None
+            || config.security.policy == SecurityPolicy::None
+        {
+            return Err(RuntimeError::Config(
+                "opcua.security: a non-loopback endpoint_url requires security.mode and security.policy other than None"
+                    .into(),
+            ));
+        }
+        if config.security.allow_anonymous {
+            return Err(RuntimeError::Config(
+                "opcua.security: a non-loopback endpoint_url requires allow_anonymous: false"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl RawOpcUaSecurityConfig {
@@ -450,7 +498,7 @@ fn resolve_relative(base_dir: &Path, raw: &Path) -> PathBuf {
 }
 
 /// Basic structural validation of an `opc.tcp://` endpoint URL.
-fn validate_endpoint_url(url: &str) -> Result<(), String> {
+pub(crate) fn validate_endpoint_url(url: &str) -> Result<(), String> {
     let rest = url
         .strip_prefix("opc.tcp://")
         .ok_or_else(|| "must use the opc.tcp scheme".to_string())?;
@@ -482,6 +530,34 @@ fn validate_endpoint_url(url: &str) -> Result<(), String> {
         }
         None => Ok(()),
     }
+}
+
+/// Extract the host portion of an `opc.tcp://` endpoint URL, stripping any
+/// port and the brackets around IPv6 literals.
+pub(crate) fn endpoint_host(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("opc.tcp://")?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.starts_with('[') {
+        let close = authority.find(']')?;
+        return Some(authority[1..close].to_string());
+    }
+    match authority.rsplit_once(':') {
+        Some((host, _)) => Some(host.to_string()),
+        None => Some(authority.to_string()),
+    }
+}
+
+/// True for hosts that bind to the loopback interface only (`localhost`,
+/// `127.0.0.0/8`, IPv6 `::1`); see design §9.1. `0.0.0.0` is deliberately
+/// *not* loopback: it binds every interface, including external ones.
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 fn validate_port(port: &str) -> Result<(), String> {
@@ -698,7 +774,7 @@ mod tests {
     fn disabled_opcua_section_is_kept_but_not_endpoint_checked() {
         let root = setup(
             "opcua_disabled",
-            "runtime_version: 1\nopcua:\n  enabled: false\n  endpoint_url: \"http://not-opc\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime\"\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n",
+            "runtime_version: 1\nopcua:\n  enabled: false\n  endpoint_url: \"http://not-opc\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime:ns\"\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n",
         );
         let config = HostConfig::load(&root.join("runtime.yaml")).unwrap();
         let opcua = config.opcua.expect("opcua section must be kept");
@@ -711,7 +787,7 @@ mod tests {
     fn enabled_opcua_requires_opc_tcp_endpoint() {
         let root = setup(
             "opcua_bad_endpoint",
-            "runtime_version: 1\nopcua:\n  enabled: true\n  endpoint_url: \"http://127.0.0.1:4840\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime\"\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n",
+            "runtime_version: 1\nopcua:\n  enabled: true\n  endpoint_url: \"http://127.0.0.1:4840\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime:ns\"\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n",
         );
         let error = HostConfig::load(&root.join("runtime.yaml")).unwrap_err();
         assert!(error.to_string().contains("opc.tcp"), "{error}");
@@ -721,7 +797,7 @@ mod tests {
     fn opcua_cert_paths_resolve_against_config_dir() {
         let root = setup(
             "opcua_certs",
-            "runtime_version: 1\nopcua:\n  enabled: true\n  endpoint_url: \"opc.tcp://127.0.0.1:4840\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime\"\n  security:\n    mode: SignAndEncrypt\n    policy: Basic256Sha256\n    allow_anonymous: false\n    server_certificate: ./cert/server.der\n    server_private_key: ./cert/server-key.pem\n    trust_list: ./cert/trusted\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n",
+            "runtime_version: 1\nopcua:\n  enabled: true\n  endpoint_url: \"opc.tcp://127.0.0.1:4840\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime:ns\"\n  security:\n    mode: SignAndEncrypt\n    policy: Basic256Sha256\n    allow_anonymous: false\n    server_certificate: ./cert/server.der\n    server_private_key: ./cert/server-key.pem\n    trust_list: ./cert/trusted\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n",
         );
         fs::create_dir_all(root.join("cert")).unwrap();
         fs::write(root.join("cert/server.der"), b"cert").unwrap();
@@ -752,7 +828,7 @@ mod tests {
         // SignAndEncrypt without a policy is rejected.
         let root = setup(
             "sec_no_policy",
-            "runtime_version: 1\nopcua:\n  enabled: true\n  endpoint_url: \"opc.tcp://127.0.0.1:4840\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime\"\n  security:\n    mode: SignAndEncrypt\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n",
+            "runtime_version: 1\nopcua:\n  enabled: true\n  endpoint_url: \"opc.tcp://127.0.0.1:4840\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime:ns\"\n  security:\n    mode: SignAndEncrypt\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n",
         );
         let error = HostConfig::load(&root.join("runtime.yaml")).unwrap_err();
         assert!(
@@ -763,7 +839,7 @@ mod tests {
         // Sign with a policy but without certificate material is rejected.
         let root = setup(
             "sec_no_certs",
-            "runtime_version: 1\nopcua:\n  enabled: true\n  endpoint_url: \"opc.tcp://127.0.0.1:4840\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime\"\n  security:\n    mode: Sign\n    policy: Basic256Sha256\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n",
+            "runtime_version: 1\nopcua:\n  enabled: true\n  endpoint_url: \"opc.tcp://127.0.0.1:4840\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime:ns\"\n  security:\n    mode: Sign\n    policy: Basic256Sha256\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n",
         );
         let error = HostConfig::load(&root.join("runtime.yaml")).unwrap_err();
         assert!(
@@ -776,10 +852,124 @@ mod tests {
         // Certificate paths that do not exist are rejected.
         let root = setup(
             "sec_missing_cert",
-            "runtime_version: 1\nopcua:\n  enabled: true\n  endpoint_url: \"opc.tcp://127.0.0.1:4840\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime\"\n  security:\n    mode: Sign\n    policy: Basic256Sha256\n    server_certificate: ./cert/server.der\n    server_private_key: ./cert/server-key.pem\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n",
+            "runtime_version: 1\nopcua:\n  enabled: true\n  endpoint_url: \"opc.tcp://127.0.0.1:4840\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime:ns\"\n  security:\n    mode: Sign\n    policy: Basic256Sha256\n    server_certificate: ./cert/server.der\n    server_private_key: ./cert/server-key.pem\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n",
         );
         let error = HostConfig::load(&root.join("runtime.yaml")).unwrap_err();
         assert!(error.to_string().contains("does not exist"), "{error}");
+    }
+
+    #[test]
+    fn endpoint_url_defaults_to_loopback() {
+        let root = setup(
+            "opcua_default_url",
+            "runtime_version: 1\nopcua:\n  enabled: true\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime:ns\"\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n",
+        );
+        let config = HostConfig::load(&root.join("runtime.yaml")).unwrap();
+        let opcua = config.opcua.expect("opcua section must be kept");
+        assert_eq!(opcua.endpoint_url, "opc.tcp://127.0.0.1:4840");
+        assert!(opcua.enabled);
+    }
+
+    #[test]
+    fn non_loopback_unsecured_endpoint_is_rejected() {
+        for (name, url) in [
+            ("wildcard", "opc.tcp://0.0.0.0:4840"),
+            ("lan_ip", "opc.tcp://192.168.1.10:4840"),
+            ("ipv6_global", "opc.tcp://[2001:db8::1]:4840"),
+        ] {
+            let body = format!(
+                "runtime_version: 1\nopcua:\n  enabled: true\n  endpoint_url: \"{url}\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime:ns\"\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n"
+            );
+            let root = setup(name, &body);
+            let error = HostConfig::load(&root.join("runtime.yaml")).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("non-loopback"), "{name}: {message}");
+        }
+    }
+
+    #[test]
+    fn non_loopback_anonymous_endpoint_is_rejected() {
+        // Fully encrypted but still anonymous: rejected on non-loopback.
+        let root = setup(
+            "opcua_anon_remote",
+            "runtime_version: 1\nopcua:\n  enabled: true\n  endpoint_url: \"opc.tcp://192.168.1.10:4840\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime:ns\"\n  security:\n    mode: SignAndEncrypt\n    policy: Basic256Sha256\n    server_certificate: ./cert/server.der\n    server_private_key: ./cert/server-key.pem\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n",
+        );
+        fs::create_dir_all(root.join("cert")).unwrap();
+        fs::write(root.join("cert/server.der"), b"cert").unwrap();
+        fs::write(root.join("cert/server-key.pem"), b"key").unwrap();
+
+        let error = HostConfig::load(&root.join("runtime.yaml")).unwrap_err();
+        assert!(
+            error.to_string().contains("allow_anonymous: false"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn non_loopback_secure_non_anonymous_endpoint_is_accepted() {
+        let root = setup(
+            "opcua_secure_remote",
+            "runtime_version: 1\nopcua:\n  enabled: true\n  endpoint_url: \"opc.tcp://192.168.1.10:4840\"\n  application_uri: \"urn:datafactory:runtime\"\n  namespace_uri: \"urn:datafactory:runtime:ns\"\n  security:\n    mode: SignAndEncrypt\n    policy: Basic256Sha256\n    allow_anonymous: false\n    server_certificate: ./cert/server.der\n    server_private_key: ./cert/server-key.pem\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n",
+        );
+        fs::create_dir_all(root.join("cert")).unwrap();
+        fs::write(root.join("cert/server.der"), b"cert").unwrap();
+        fs::write(root.join("cert/server-key.pem"), b"key").unwrap();
+
+        let config = HostConfig::load(&root.join("runtime.yaml")).unwrap();
+        let opcua = config.opcua.unwrap();
+        assert!(!opcua.security.allow_anonymous);
+        assert_eq!(opcua.security.mode, SecurityMode::SignAndEncrypt);
+    }
+
+    #[test]
+    fn loopback_host_matrix() {
+        // Loopback forms are accepted.
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("LOCALHOST"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.9.9.9"));
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("[::1]"));
+        // Anything that binds beyond loopback is not.
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("192.168.1.10"));
+        assert!(!is_loopback_host("[2001:db8::1]"));
+        assert!(!is_loopback_host("example.com"));
+        // host extraction from full endpoint URLs
+        assert_eq!(
+            endpoint_host("opc.tcp://127.0.0.1:4840").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            endpoint_host("opc.tcp://localhost:50000/Path").as_deref(),
+            Some("localhost")
+        );
+        assert_eq!(
+            endpoint_host("opc.tcp://[::1]:4840").as_deref(),
+            Some("::1")
+        );
+        assert_eq!(
+            endpoint_host("opc.tcp://192.168.1.10").as_deref(),
+            Some("192.168.1.10")
+        );
+    }
+
+    #[test]
+    fn opcua_uris_must_differ() {
+        let root = setup(
+            "opcua_same_uris",
+            "runtime_version: 1\nopcua:\n  enabled: true\n  endpoint_url: \"opc.tcp://127.0.0.1:4840\"\n  application_uri: \"urn:same\"\n  namespace_uri: \"urn:same\"\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n",
+        );
+        let error = HostConfig::load(&root.join("runtime.yaml")).unwrap_err();
+        assert!(error.to_string().contains("must differ"), "{error}");
+
+        // Disabled sections keep the URIs but skip the check.
+        let root = setup(
+            "opcua_same_uris_disabled",
+            "runtime_version: 1\nopcua:\n  enabled: false\n  endpoint_url: \"opc.tcp://127.0.0.1:4840\"\n  application_uri: \"urn:same\"\n  namespace_uri: \"urn:same\"\ninstances:\n  - id: a\n    project: ./two_tank.yaml\n",
+        );
+        let config = HostConfig::load(&root.join("runtime.yaml")).unwrap();
+        assert!(!config.opcua.unwrap().enabled);
     }
 
     #[test]
