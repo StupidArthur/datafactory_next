@@ -1,13 +1,26 @@
 //! OPC UA serving layer for the Runtime Host (design §9).
 //!
-//! R5 scope is the library proof of concept: `OpcUaServer` owns a dedicated
-//! OS thread and a single-threaded tokio runtime (`ServerBuilder` and the
-//! server futures are not `Send`), serves the configured endpoint and exposes
-//! a minimal proof-of-concept address space. R6–R8 replace the PoC nodes with
-//! the Tag Catalog mapping, snapshot publishing and the write handler.
+//! `OpcUaServer` owns a dedicated OS thread and a single-threaded tokio
+//! runtime (`ServerBuilder` and the server futures are not `Send`), serves
+//! the configured endpoint and builds the §7.2 address space from the
+//! instance Tag Catalogs (`address_space`); `value` maps between DataFactory
+//! tag types and OPC UA types. R7 adds snapshot publishing, R8 the write
+//! handler.
 //!
 //! The `opcua` cargo feature gates this whole module: default builds never
 //! compile or link any OPC UA code (design §9.2).
+
+pub mod address_space;
+pub mod value;
+
+pub use address_space::{
+    validate_catalogs, AddressSpaceIndex, InstanceCatalog, InstanceNodes, TagEntry,
+    INSTANCE_STATUS_NODES, SERVER_STATUS_NODES,
+};
+pub use value::{
+    percent_encode, status_node_identifier, tag_node_identifier, ua_data_type, value_to_variant,
+    variant_to_value,
+};
 
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -17,14 +30,13 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use opcua::crypto::SecurityPolicy as UaSecurityPolicy;
-use opcua::nodes::{AccessLevel, VariableBuilder};
 use opcua::server::diagnostics::NamespaceMetadata;
 use opcua::server::node_manager::memory::{simple_node_manager, SimpleNodeManager};
 use opcua::server::{
     Server, ServerBuilder, ServerHandle, ServerUserToken, SubscriptionCache,
     ANONYMOUS_USER_TOKEN_ID,
 };
-use opcua::types::{DataTypeId, DataValue, MessageSecurityMode, NodeId, StatusCode, Variant};
+use opcua::types::MessageSecurityMode;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{
@@ -33,18 +45,7 @@ use crate::config::{
 };
 use crate::RuntimeError;
 
-/// Node paths of the proof-of-concept address space, inside the configured
-/// namespace.
-pub mod poc_paths {
-    /// Organizing folder for all Runtime nodes.
-    pub const FOLDER: &str = "DataFactory";
-    /// Published counter, changed via `set_value` from the host thread.
-    pub const COUNTER: &str = "DataFactory/PoC/Counter";
-    /// Read-callback node; every read is answered by a dynamic getter.
-    pub const ECHO: &str = "DataFactory/PoC/Echo";
-    /// Write-callback node; written values are captured and served back.
-    pub const WRITABLE: &str = "DataFactory/PoC/WritableValue";
-}
+use address_space::build_address_space;
 
 /// Port used when the endpoint URL omits one (the OPC UA default port).
 pub const DEFAULT_OPC_UA_PORT: u16 = 4840;
@@ -133,14 +134,17 @@ struct ServerReady {
     node_manager: Arc<SimpleNodeManager>,
     subscriptions: Arc<SubscriptionCache>,
     stop_token: CancellationToken,
+    address_space: AddressSpaceIndex,
 }
 
-/// Create the server from the Host configuration plus PoC user credentials.
+/// Create the server from the Host configuration, instance catalogs and
+/// user credentials.
 ///
 /// Runs on the OPC UA thread inside the tokio runtime context because
 /// `ServerBuilder::build` creates tokio synchronization primitives.
 fn build_server(
     config: &OpcUaConfig,
+    catalogs: &[InstanceCatalog],
     users: &[PlainUserCredentials],
     host: &str,
     port: u16,
@@ -213,12 +217,17 @@ fn build_server(
         .default_endpoint("datafactory");
 
     let (server, handle) = builder.build()?;
-    let ready = populate_poc_nodes(&handle, config)?;
+    let ready = populate_address_space(&handle, config, catalogs)?;
     Ok((server, handle, ready))
 }
 
-/// Populate the R5 proof-of-concept address space and resolve the namespace.
-fn populate_poc_nodes(handle: &ServerHandle, config: &OpcUaConfig) -> Result<ServerReady, String> {
+/// Resolve the namespace and build the §7.2 address space from the instance
+/// Tag Catalogs.
+fn populate_address_space(
+    handle: &ServerHandle,
+    config: &OpcUaConfig,
+    catalogs: &[InstanceCatalog],
+) -> Result<ServerReady, String> {
     let namespace_index = handle
         .get_namespace_index(&config.namespace_uri)
         .ok_or_else(|| format!("namespace {} was not registered", config.namespace_uri))?;
@@ -227,74 +236,14 @@ fn populate_poc_nodes(handle: &ServerHandle, config: &OpcUaConfig) -> Result<Ser
         .get_of_type::<SimpleNodeManager>()
         .ok_or_else(|| "the simple node manager is missing from the server".to_string())?;
 
-    let ns = namespace_index;
-    let folder_id = NodeId::new(ns, poc_paths::FOLDER);
-    let counter_id = NodeId::new(ns, poc_paths::COUNTER);
-    let echo_id = NodeId::new(ns, poc_paths::ECHO);
-    let writable_id = NodeId::new(ns, poc_paths::WRITABLE);
-
-    {
-        let mut space = node_manager.address_space().write();
-        if !space.add_folder(
-            &folder_id,
-            "DataFactory",
-            "DataFactory",
-            &NodeId::objects_folder_id(),
-        ) {
-            return Err("cannot create the DataFactory folder".into());
-        }
-        for (id, name, writable) in [
-            (&counter_id, "Counter", false),
-            (&echo_id, "Echo", false),
-            (&writable_id, "WritableValue", true),
-        ] {
-            let mut builder = VariableBuilder::new(id, name, name)
-                .organized_by(&folder_id)
-                // async-opcua 0.19 does not infer the data type from the
-                // builder value, and an invalid variable panics on insert.
-                .data_type(DataTypeId::Double)
-                .value(0.0f64);
-            if writable {
-                // Publisher nodes stay read-only; actuator nodes accept
-                // client writes (the write callback intercepts them).
-                builder = builder
-                    .user_access_level(AccessLevel::CURRENT_READ | AccessLevel::CURRENT_WRITE);
-            }
-            if !builder.insert(&mut *space) {
-                return Err(format!("cannot create the {name} variable"));
-            }
-        }
-    }
-
-    // Echo: served entirely by a dynamic read callback.
-    node_manager
-        .inner()
-        .add_read_callback(echo_id, |_, _, _| Ok(DataValue::new_now(42.0f64)));
-
-    // WritableValue: a registered write callback intercepts every write, so
-    // SimpleNodeManager does not store the value in the address space itself.
-    // The callback records the value and a read callback serves it back. R8
-    // replaces this with `RuntimeHandle::submit_writes`.
-    let written: Arc<Mutex<Option<Variant>>> = Arc::new(Mutex::new(None));
-    let writer = Arc::clone(&written);
-    node_manager
-        .inner()
-        .add_write_callback(writable_id.clone(), move |value: DataValue, _| {
-            *writer.lock().unwrap() = Some(value.value.unwrap_or(Variant::Empty));
-            StatusCode::Good
-        });
-    node_manager
-        .inner()
-        .add_read_callback(writable_id, move |_, _, _| {
-            let stored = written.lock().unwrap().clone();
-            Ok(DataValue::new_now(stored.unwrap_or(Variant::Double(0.0))))
-        });
+    let address_space = build_address_space(&node_manager, namespace_index, catalogs)?;
 
     Ok(ServerReady {
         namespace_index,
         node_manager,
         subscriptions: handle.subscriptions().clone(),
         stop_token: handle.token().clone(),
+        address_space,
     })
 }
 
@@ -308,21 +257,32 @@ pub struct OpcUaServer {
     namespace_index: u16,
     node_manager: Arc<SimpleNodeManager>,
     subscriptions: Arc<SubscriptionCache>,
+    address_space: AddressSpaceIndex,
     stop_token: CancellationToken,
     thread: Option<JoinHandle<()>>,
 }
 
 impl OpcUaServer {
-    /// Start the OPC UA server described by `config`.
+    /// Start the OPC UA server described by `config` without instance nodes.
     pub fn start(config: &OpcUaConfig) -> Result<Self, RuntimeError> {
-        Self::start_with_users(config, &[])
+        Self::start_with_catalogs(config, &[], &[])
     }
 
     /// Start the server with additional username/password credentials.
-    ///
-    /// The §9.1 security rules are re-checked here at start time.
     pub fn start_with_users(
         config: &OpcUaConfig,
+        users: &[PlainUserCredentials],
+    ) -> Result<Self, RuntimeError> {
+        Self::start_with_catalogs(config, &[], users)
+    }
+
+    /// Start the server and build the §7.2 address space for the given
+    /// instance Tag Catalogs.
+    ///
+    /// The §9.1 security rules are re-checked here at start time.
+    pub fn start_with_catalogs(
+        config: &OpcUaConfig,
+        catalogs: &[InstanceCatalog],
         users: &[PlainUserCredentials],
     ) -> Result<Self, RuntimeError> {
         if !config.enabled {
@@ -337,6 +297,7 @@ impl OpcUaServer {
         let run_error = Arc::new(Mutex::new(None::<String>));
 
         let thread_config = config.clone();
+        let thread_catalogs = catalogs.to_vec();
         let thread_users = users.to_vec();
         let thread_host = host.clone();
         let thread_finished = Arc::clone(&finished);
@@ -356,7 +317,13 @@ impl OpcUaServer {
                     }
                 };
                 runtime.block_on(async move {
-                    let built = build_server(&thread_config, &thread_users, &thread_host, port);
+                    let built = build_server(
+                        &thread_config,
+                        &thread_catalogs,
+                        &thread_users,
+                        &thread_host,
+                        port,
+                    );
                     let (server, _handle, ready) = match built {
                         Ok(built) => built,
                         Err(message) => {
@@ -453,6 +420,7 @@ impl OpcUaServer {
             namespace_index: ready.namespace_index,
             node_manager: ready.node_manager,
             subscriptions: ready.subscriptions,
+            address_space: ready.address_space,
             stop_token: ready.stop_token,
             thread: Some(thread),
         })
@@ -478,9 +446,9 @@ impl OpcUaServer {
         &self.subscriptions
     }
 
-    /// Node id of a proof-of-concept node in the server namespace.
-    pub fn poc_node_id(&self, path: &str) -> NodeId {
-        NodeId::new(self.namespace_index, path)
+    /// Index of the instance/tag nodes built from the Tag Catalogs.
+    pub fn address_space(&self) -> &AddressSpaceIndex {
+        &self.address_space
     }
 
     /// Stop the server and wait for its thread to exit. Idempotent.

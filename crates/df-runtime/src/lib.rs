@@ -1,3 +1,8 @@
+// `coverage` is only defined by coverage tooling on nightly (cargo-llvm-cov);
+// on stable builds the `cfg_attr(coverage, ...)` attributes are inert and the
+// lint would otherwise flag every occurrence (same allowance as df-core).
+#![allow(unexpected_cfgs)]
+
 use df_core::{Engine, EngineError, Snapshot, Value};
 use std::collections::BTreeMap;
 use std::fmt;

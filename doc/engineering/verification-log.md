@@ -309,6 +309,64 @@ test result: ok. 3 passed; 0 failed   — df-sdk 单元测试
 - `default_pki_dir`（临时目录 + pid + 序号）仅为无证书配置的样例密钥对落盘目录；正式部署应显式配置证书路径与 trust_list，生产信任链验证归 R8 部署配置。
 - 环境说明：G: 盘构建空间不足（曾到 0 空闲），`cargo clean` 回收 4.7 GB 后全部 cargo 命令以 `CARGO_TARGET_DIR=D:\cargo_target_df` 在 D: 盘构建（会话环境变量，未改仓库配置）。
 
+## 2026-11-02：R6 验证（Tag Catalog → NodeId/Variant/AccessLevel 映射）
+
+范围：`crates/df-runtime` 新增 `src/opcua/value.rs`（§7.3/§7.4 类型与 NodeId 映射）与 `src/opcua/address_space.rs`（§7.2 地址空间构建与索引）；`src/opcua/mod.rs` 重构（`start_with_catalogs` 接入 catalog、移除 PoC 节点、新增 `address_space()` 访问器）；`tests/opcua_poc.rs` 重写为 4 个 catalog 驱动集成测试；`src/lib.rs` 增加 `#![allow(unexpected_cfgs)]`。
+
+### 1. 格式与测试
+
+```text
+命令: cargo fmt --all -- --check
+结果: 通过（退出码 0）
+
+命令: cargo test -p df-runtime --features opcua
+结果: 全部目标 0 failed
+
+test result: ok. 67 passed; 0 failed  — df-runtime 单元测试（默认 57 + R5 opcua 模块 3 + R6 新增 7：value.rs 5 + address_space.rs 2）
+test result: ok. 2 passed; 0 failed   — df-runtime bin cli 参数解析测试
+test result: ok. 2 passed; 0 failed   — df-runtime host_config 集成测试
+test result: ok. 4 passed; 0 failed   — df-runtime opcua_poc 集成测试（R5 的 2 个重写为 catalog 驱动 4 个）
+小计: 75 passed / 0 failed
+
+命令: cargo test --workspace（默认构建，无 opcua feature）
+结果: 通过（退出码 0，无警告）
+合计: 86 passed / 0 failed（df-core 19 + rust_sdk 3 + df-runtime 57 + host_config 2 + cli 2 + df-sdk 3）
+
+命令: cargo tree -p df-runtime（默认）
+结果: 无 async-opcua/tokio/tokio-util；--features opcua 时三者全部出现（§9.2 隔离复验）
+```
+
+### 2. R6 映射覆盖点（value.rs，5 个单元测试）
+
+- `data_type_matrix_matches_the_design_table`：BOOL→Boolean、INT64→Int64、FLOAT64→Double、STRING→String（§7.4）；未知（FLOAT32）、小写、空串类型名一律拒绝，不猜测。
+- `value_variant_round_trip_preserves_the_type`：四种类型 value→variant→value 严格往返。
+- `variant_to_value_rejects_type_mismatches_and_empty`：数值近似类型（Double→INT64、Int64→FLOAT64）、跨类（Boolean/UAString）、`Variant::Empty`、未知 tag 类型全部返回 None，不静默转换（WR-03 的映射层基础）。
+- `percent_encoding_keeps_unreserved_and_escapes_the_rest`：RFC 3986 unreserved（字母/数字/-/`.`/`_`/`~`）直通；`/`→%2F（杜绝路径歧义）、空格→%20、中文按 UTF-8 字节大写 %XX；编码可逆。
+- `node_identifiers_follow_the_design_paths`：Tag 节点 `df/instances/{instance}/tags/{encoded_tag}`、Status 节点 `df/instances/{instance}/status/{name}`（§7.3）。
+- STRING 映射实现说明：0.19 `UAString::as_ref()` 直接返回 `&str`（非 Option），null 串归一为 ""——映射据此返回 `Value::String("")` 而非拒绝。
+
+### 3. 地址空间覆盖点（address_space.rs + 集成测试）
+
+- `catalogs_reject_duplicates_and_unknown_types`：空实例 ID/空 Tag 名/重复实例 ID/重复 Tag 名/未知类型在插入任何节点前拒绝（§4.2 严格性，不留半建地址空间）。
+- `status_initial_values_follow_the_node_types`：ServerStatus（State="Starting"、InstanceCount=实例数、RunningInstanceCount=0）与实例 Status 8 项（CycleTime/SimulationTime/LastCycleDurationMs 为 Double 归零，CycleIndex/OverrunCount/MissedDeadlines/RejectedWriteBatches 为 UInt64 归零）初值与类型一致。
+- 集成 `catalog_address_space_reads_writes_and_subscriptions`（两水箱 catalog 双实例）：§7.2 骨架直读（ServerStatus "Starting"/2/0；实例 Status State/CycleTime/CycleIndex/RejectedWriteBatches 归零）；tank_1.level 初始 0.15（FLOAT64）；EngineeringUnit 属性读到 "m"（编译器 tank level 单位，UA-06 单位路径）；实例隔离 UA-04（tank-a/tank-b 同名 Tag NodeId 不同，set_value 后 tank-a=7.0 而 tank-b 保持 0.15）；主机线程 `set_value` 跨线程可读且客户端订阅（100ms）收到 9.0 更新（R7 发布路径预验证）；客户端写可写 Tag plant_inlet_flow=0.002 落盘回读（R6 为 SimpleNodeManager 默认存储）；客户端写只读 Tag 返回 BadUserAccessDenied（库按 AccessLevel 位拒绝；WR-02 设计值 BadNotWritable 的最终语义在 R8 写处理器接入时决断）；stop 幂等且端口释放。
+- 集成 `node_ids_are_stable_across_restarts`：同一实例重启后全部 Tag 节点与 Status 节点 NodeId 逐一相同（UA-03）。
+- 集成 `tag_metadata_description_and_unit_property`：合成 catalog（unit="m"、description="water level"、initial=1.0）——初值、Description 属性（OPC UA Description 读取返回 LocalizedText 而非 String）、EngineeringUnit 属性均正确（UA-06）。
+- 集成 `secure_channel_with_username_password_auth`：catalog 地址空间下 SignAndEncrypt + Basic256Sha256 + 用户名口令复验（正确口令经加密通道读 tank_1.level=0.15；错误口令 3 秒内无法激活）。
+
+### 4. 实现与构建说明
+
+- `build_address_space` 在服务器线程内、`run_with` 之前执行：add_folder/VariableBuilder 均走 `&mut AddressSpace` 写锁；任一节点插入失败即整体启动失败（Err 上抛，不留残缺空间）。`AddressSpaceIndex`（instance/tag → NodeId/类型/可写性索引）经 `OpcUaServer::address_space()` 暴露，供 R7 发布器与 R8 写处理器使用。
+- Tag/Status 节点 NodeId 为字符串标识 `ns={namespace_uri 索引}; s=df/...`，不含动态命名空间号；实例 ID 受 Host 配置校验约束（字母/数字/下划线/连字符），仅 Tag 名需 percent-encode。
+- df-runtime/src/lib.rs 增加 `#![allow(unexpected_cfgs)]`（与 df-core/lib.rs 既有做法一致）：`#[cfg_attr(coverage, coverage(off))]` 的 `coverage` cfg 仅由 nightly 覆盖率工具定义，stable 下 inert 但会触发 lint。
+
+### 5. 边界说明（未验证项）
+
+- UA-02（独立客户端 Browse DataFactory/Instances 层级）与客户端侧完整 UA-05 类型矩阵（BOOL/INT64 直读）归 R9 闭环自动化测试；R6 已直读覆盖 FLOAT64/String/UInt32/UInt64，BOOL/INT64 变体映射由 value.rs 单元测试覆盖。
+- Status 节点在 R6 保持初值（"Starting"/0）：实时值写入归 R7 Snapshot 发布器；写路径当前为地址空间默认存储，与 Engine 的闭环（`RuntimeHandle::submit_writes`）归 R8。
+- percent-encode 仅由单元测试覆盖：编译器 Tag 名限制为 `[A-Za-z0-9_.]`，实际项目不含需转义字符（设计如此，编码路径为未来宽松命名预留）。
+
+
 
 
 

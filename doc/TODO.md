@@ -385,8 +385,22 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
 - [x] 服务器生命周期（opcua/mod.rs，3 个单元测试 + PoC 覆盖）：专用 OS 线程 + current_thread tokio runtime（ServerBuilder 非 Send）；ready 消息前先绑定 tokio TcpListener，端口占用在 ready 阶段同步干净失败（专项测试占用端口启动必失败）；ready 后 TCP 探测确认端点可接受连接（为 R8 退出码 4 提供检测路径）；stop() 取消 token + join 线程，幂等，Drop 调 stop。
 - [x] 依赖隔离（§9.2）：`cargo tree -p df-runtime`（默认）无 async-opcua/tokio/tokio-util；`--features opcua` 时三者全部出现。opcua 模块与 opcua_poc 测试目标均以 required-features 门控。
 - [x] 环境说明：G: 盘构建空间不足（曾到 0 空闲），`cargo clean` 回收 4.7 GB 后，全部 cargo 命令通过 `CARGO_TARGET_DIR=D:\cargo_target_df` 在 D: 盘构建（会话环境变量，未改配置文件）。
-- [~] PoC 节点为临时地址空间（DataFactory/PoC/{Counter,Echo,WritableValue}）：Tag Catalog → NodeId 映射（R6）、快照周期发布（R7）、写处理器与 allow_anonymous 认证器及用户配置（R8）随后接入；退出码 4 的 CLI 接线在 R8 验证。
+- [x] R6 已将 PoC 节点替换为 Tag Catalog 驱动的 §7.2 地址空间（见 R6 验证记录）；剩余：快照周期发布（R7）、写处理器与 allow_anonymous 认证器及用户配置（R8）随后接入；退出码 4 的 CLI 接线在 R8 验证。
 - 证据：`doc/engineering/verification-log.md#2026-11-02-r5-验证`。
+
+### 2026-11-02：R6 验证（Tag Catalog → NodeId/Variant/AccessLevel 映射）
+
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test -p df-runtime --features opcua` 通过：75 个测试全部通过、0 失败（df-runtime lib 67 = 默认 57 + R5 opcua 模块 3 + R6 新增 7、bin cli 2、host_config 2、opcua_poc 4）。
+- [x] `cargo test --workspace`（默认构建）通过：86 个测试全部通过、0 失败、0 警告。
+- [x] 依赖隔离复验（§9.2）：`cargo tree -p df-runtime`（默认）无 async-opcua/tokio/tokio-util；`--features opcua` 时三者全部出现。
+- [x] `opcua/value.rs`（类型映射，5 个单元测试）：§7.4 类型矩阵 BOOL→Boolean / INT64→Int64 / FLOAT64→Double / STRING→String，未知/小写类型名拒绝不猜测；`value_to_variant`/`variant_to_value` 严格往返，数值近似类型（Int64↔Double）与 Variant::Empty 不静默转换（WR-03 基础）；`percent_encode` RFC 3986 unreserved 直通、其余字节大写 %XX（可逆、不产生路径歧义）；`tag_node_identifier`/`status_node_identifier` 按 §7.3 路径拼装。
+- [x] `opcua/address_space.rs`（§7.2 布局，2 个单元测试 + 集成覆盖）：`validate_catalogs` 结构校验前置（空实例 ID/空 Tag 名/重复实例 ID/重复 Tag 名/未知类型全部拒绝，不残留半建地址空间）；DataFactory 根 Folder + ServerStatus（State/InstanceCount/RunningInstanceCount）+ 每实例 Status（8 项 §7.2 指标）/Tags 两个 Folder；Tag 节点以完整 Tag 名为 BrowseName；可写 Tag 显式 `CURRENT_READ | CURRENT_WRITE`，只读保持默认 CURRENT_READ；单位以自定义 String 属性 EngineeringUnit（`{tag_identifier}/unit`，HasProperty）暴露；`AddressSpaceIndex` 提供 instance/tag → NodeId 索引供 R7/R8 使用。
+- [x] 集成测试（opcua_poc 重写为 4 个，真实客户端 + 两水箱 catalog）：§7.2 骨架与初始值（ServerStatus "Starting"/2/0、实例 Status 归零、tank_1.level=0.15）；EngineeringUnit 属性读到 "m"（UA-06 单位路径）；Description 属性读到配置说明（UA-06，OPC UA Description 为 LocalizedText）；实例隔离（UA-04，两实例同名 Tag NodeId 不同、值互不影响）；NodeId 跨重启稳定（UA-03，Tag 与 Status 节点重启前后一致）；主机线程 `set_value` 跨线程可读且客户端订阅收到更新（R7 发布路径预验证）；客户端写可写 Tag 落盘回读（R6 为地址空间存储，R8 换成 submit-to-runtime）；客户端写只读 Tag 被拒（库返回 BadUserAccessDenied，WR-02 语义差异留 R8 决断）；SignAndEncrypt + 用户名口令在 catalog 地址空间下复验通过；stop 幂等且端口释放。
+- [x] 库行为约束记录：OPC UA Description 属性读取返回 LocalizedText 而非 String；UAString::as_ref() 直接返回 &str 且 null 串归一为 ""（value.rs STRING 映射据此返回空串）；0.19 的 `add_folder`/`VariableBuilder::insert` 走 `&mut AddressSpace` 写锁护栏。
+- [x] 构建配置：df-runtime/src/lib.rs 增加 `#![allow(unexpected_cfgs)]`（与 df-core 相同处理）——`#[cfg_attr(coverage, coverage(off))]` 的 `coverage` cfg 仅由 nightly 覆盖率工具定义，stable 构建下 inert。
+- [~] 边界：UA-02（独立客户端 Browse Instances/Tags 层级）与客户端侧完整 UA-05 类型矩阵验证归 R9 闭环测试（R6 已由直读覆盖 FLOAT64/String/UInt32/UInt64，BOOL/INT64 变体映射由 value.rs 单元测试覆盖）；Status 节点在 R6 保持初始值（"Starting"/0），实时值由 R7 发布器写入；写路径当前为 SimpleNodeManager 默认存储，R8 改为 `RuntimeHandle::submit_writes` 闭环。
+- 证据：`doc/engineering/verification-log.md#2026-11-02-r6-验证`。
 
 
 ## 13. Runtime 系统设计基线
@@ -399,7 +413,7 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
   - [x] R3 RuntimeManager 多实例生命周期与故障隔离。（2026-11-02，多实例 CLI 入口归 R4）
   - [x] R4 CLI Host 模式（run --config / check）、多实例状态与优雅停止。（2026-11-02）
   - [x] R5 OPC UA 库 PoC、Endpoint 与安全配置。（2026-11-02，见 §12 R5 验证记录）
-  - [ ] R6 Tag Catalog → NodeId/Variant/AccessLevel 映射。
+  - [x] R6 Tag Catalog → NodeId/Variant/AccessLevel 映射。（2026-11-02，见 §12 R6 验证记录）
   - [ ] R7 Snapshot 周期发布与订阅通知。
   - [ ] R8 OPC UA Write Handler、批次聚合、确认与取消。
   - [ ] R9 双水箱闭环案例与独立客户端自动化测试。
