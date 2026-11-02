@@ -161,4 +161,43 @@ stop → "runtime stopped"，退出码 0
 - `df-runtime check --config` / `run --config` CLI 与多实例启动在 R3/R4 接线后做端到端验收；本阶段配置校验仅以库 API + 单元/集成测试验证。
 - OPC UA 安全配置仅做结构与文件存在性校验；证书生成、信任链与「非回环网卡不得使用不安全配置」在 R5 落地。
 
+## 2026-11-02：R3 验证（RuntimeManager 多实例生命周期与故障隔离）
+
+范围：`crates/df-runtime` 新增 `src/instance.rs`、`src/manager.rs`。
+
+### 1. 格式与工作区测试
+
+```text
+命令: cargo fmt --all -- --check
+结果: 通过（退出码 0）
+
+命令: cargo test --workspace
+结果: 通过（退出码 0，无警告）
+
+test result: ok. 19 passed; 0 failed  — df-core 单元测试
+test result: ok. 3 passed; 0 failed   — df-core Rust SDK 集成测试
+test result: ok. 50 passed; 0 failed  — df-runtime 单元测试（R2 后 41 + R3 新增 9）
+test result: ok. 2 passed; 0 failed   — df-runtime host_config 集成测试
+test result: ok. 3 passed; 0 failed   — df-sdk 单元测试
+合计: 77 passed / 0 failed
+```
+
+### 2. R3 新增测试清单（manager.rs，真实 two-tank 工程文件夹具）
+
+- `start_all_isolates_failures_and_skips_disabled`：四实例配置（tank-a、tank-b、broken=损坏 YAML、off=禁用）；start_all 仅 broken 失败（错误含 "cannot compile"），tank-a/tank-b Running，broken Failed 带错误记录，off 保持 Configured。
+- `instances_keep_independent_engines_and_schedulers`：两实例同项目独立推进；停止 tank-a 后 tank-b 周期继续；tank-a handle 提交写入返回 WorkerStopped，tank-b 写入 Applied——引擎/队列/调度互不共享。
+- `restart_resets_the_engine_to_initial_values`：重启前液位推进至 >0.155，重启后 1 个周期内回到 0.15–0.157 初始区间，cycle_index 归零——新 Engine、初始值、不续旧状态。
+- `double_start_is_rejected_and_double_stop_is_idempotent`：重复启动报 "already running"；重复停止幂等；Stopped 后可 restart 回 Running。
+- `unknown_instance_ids_are_reported`：start/stop/get 未知 ID 均报 "unknown instance id"。
+- `shutdown_stops_everything_and_handles_report_stopped`：shutdown 后全部 Stopped（broken 保持 Failed、off 保持 Configured）；旧 handle `wait_for_snapshot` 返回 Stopped、提交写入 WorkerStopped；shutdown 可重复。
+- `summaries_expose_live_metrics`：InstanceSummary 的 cycle_index/simulation_time/snapshot_revision/queue_depth/error/project 字段与实际运行一致。
+- `manager_loads_the_shipped_example_host_config`：从 `examples/host/runtime.yaml` 加载双实例并完整走 start→shutdown。
+- `manager_config_load_errors_are_reported`：配置文件缺失报 "cannot read host config"。
+
+### 3. 边界说明（未验证项）
+
+- 多实例 CLI 入口（`run --config`、stdin 多实例控制台、退出码 2/3）在 R4 接线后做端到端验收。
+- 注册表锁边界（§5.2「模型执行不持有注册表锁」）由实现结构保证（锁只在查找/簿记时持有，加载与执行在锁外），未构造并发压力场景专项测试。
+
+
 

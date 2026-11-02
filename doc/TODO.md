@@ -347,6 +347,19 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
 - [~] `df-runtime check --config` 与 `run --config` CLI 接线在 R4 实现，本阶段仅提供配置加载与校验 API。
 - 证据：`doc/engineering/verification-log.md#2026-11-02-r2-验证`。
 
+### 2026-11-02：R3 验证（RuntimeManager 多实例生命周期与故障隔离）
+
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test --workspace` 通过：77 个测试全部通过、0 失败、0 警告（df-core 19、df-core/rust_sdk 集成 3、df-runtime 50+2、df-sdk 3；df-runtime 新增 9 个 manager 单元测试）。
+- [x] 管理接口：`load_config` / `from_config` / `start_all` / `start_instance` / `stop_instance` / `restart_instance` / `get_instance`（只读 RuntimeHandle）/ `list_instances` / `shutdown` 全部落地并有测试覆盖。
+- [x] 故障隔离（§5.3）：start_all 中单实例项目编译失败（broken.yaml）仅该实例 Failed 并记录错误，其余实例继续运行；禁用实例保持 Configured；停止 tank-a 后 tank-b 周期继续推进；tank-a 停止后其 handle 提交写入返回 WorkerStopped，tank-b 写入仍正常 Applied。
+- [x] 生命周期状态（§5.4）：Configured/Starting/Running/Stopping/Stopped/Failed 由 manager 跟踪并与运行时状态同步（list_instances 时刷新）；重复启动被拒绝（"already running"）、重复停止幂等；restart 从 Stopped/Failed 均可执行。
+- [x] 重启语义（§5.3）：restart 创建全新 Engine——重启前液位已推进（>0.155），重启后 1 个周期内液位回到初始区间（0.15–0.157），不恢复旧状态。
+- [x] 注册表锁边界（§5.2）：项目加载与 Engine 启动、模型执行均在注册表锁外；锁仅用于查找与状态簿记。
+- [x] 示例 Host 配置集成验证：`RuntimeManager::load_config("examples/host/runtime.yaml")` 加载双实例、start_all 全部 Running、shutdown 全部 Stopped。
+- [~] `df-runtime run --config` CLI 入口与多实例 stdin 控制台在 R4 接线；manager 层已就绪。
+- 证据：`doc/engineering/verification-log.md#2026-11-02-r3-验证`。
+
 
 ## 13. Runtime 系统设计基线
 
@@ -355,7 +368,7 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
 - [ ] 按设计文档的 R1–R10 顺序推进实现；每项只有在代码、自动化测试和必要的端到端验证通过后才标记完成。
   - [x] R1 RuntimeHandle / Snapshot revision 与变更通知 / 写入请求状态（Queued/Applying/Applied/Rejected/Cancelled）/ 状态指标补齐（queue_depth、周期开始时间与调度延迟）。（2026-11-02，见 §12 R1 验证记录）
   - [x] R2 Runtime Host 配置结构、严格解析、路径处理与配置预检查（check 命令）。（2026-11-02，check CLI 接线归 R4）
-  - [ ] R3 RuntimeManager 多实例生命周期与故障隔离。
+  - [x] R3 RuntimeManager 多实例生命周期与故障隔离。（2026-11-02，多实例 CLI 入口归 R4）
   - [ ] R4 CLI Host 模式（run --config / check）、多实例状态与优雅停止。
   - [ ] R5 OPC UA 库 PoC、Endpoint 与安全配置。
   - [ ] R6 Tag Catalog → NodeId/Variant/AccessLevel 映射。

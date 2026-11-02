@@ -9,14 +9,18 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
 mod config;
+mod instance;
 mod loader;
+mod manager;
 mod runtime_handle;
 
 pub use config::{
     HostConfig, InstanceConfig, OpcUaConfig, OpcUaSecurityConfig, SchedulerConfig, SecurityMode,
     SecurityPolicy,
 };
+pub use instance::{InstanceState, InstanceSummary};
 pub use loader::load_engine;
+pub use manager::RuntimeManager;
 pub use runtime_handle::{RuntimeHandle, WaitOutcome, WriteState, WriteStatusInfo};
 use runtime_handle::{SnapshotFeed, WriteRegistry};
 
