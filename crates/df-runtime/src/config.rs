@@ -218,9 +218,11 @@ impl RawHostConfig {
             return fail("instances must not be empty".into());
         }
 
+        // Structural validation runs over every instance first, so that
+        // duplicate ids and invalid settings are reported as such even when
+        // other instances also reference missing files.
         let mut seen_ids = BTreeSet::new();
-        let mut instances = Vec::with_capacity(self.instances.len());
-        for raw in self.instances {
+        for raw in &self.instances {
             if !is_valid_instance_id(&raw.id) {
                 return fail(format!(
                     "instance id {:?} is invalid: use 1-64 ASCII letters, digits, '_' or '-'",
@@ -236,6 +238,11 @@ impl RawHostConfig {
                     raw.id
                 ));
             }
+        }
+
+        // Path resolution runs after the structural pass.
+        let mut instances = Vec::with_capacity(self.instances.len());
+        for raw in self.instances {
             let project = resolve_project(base_dir, &raw.project, &raw.id)?;
             instances.push(InstanceConfig {
                 id: raw.id,
@@ -568,6 +575,20 @@ mod tests {
             error.to_string().contains("duplicate instance id"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn structural_errors_are_reported_before_path_errors() {
+        // Both instances reference missing files, but the duplicate id is the
+        // structural error that must be named (CFG-02).
+        let root = setup(
+            "dup_before_path",
+            "runtime_version: 1\ninstances:\n  - id: same\n    project: ./missing-a.yaml\n  - id: same\n    project: ./missing-b.yaml\n",
+        );
+        let error = HostConfig::load(&root.join("runtime.yaml")).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("duplicate instance id"), "{message}");
+        assert!(!message.contains("does not exist"), "{message}");
     }
 
     #[test]

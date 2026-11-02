@@ -50,15 +50,25 @@ df-runtime run .\project.dfproject
 
 方式二（R2 起）：`df-runtime run` 也可直接接受 DSL v2 YAML 源文件，Runtime 内部调用 Compiler 编译后启动，不产生临时文件。
 
-标准输入命令：
+标准输入命令（单项目模式）：
 
 | 命令 | 作用 |
 |---|---|
-| status | 查看运行状态、周期耗时和超期统计 |
+| status | 查看运行状态、周期耗时和超期统计（含 queue_depth、revision） |
 | snapshot | 查看最新模型快照 |
 | stop | 优雅停止 Runtime |
 
 输入流关闭时也会执行停止清理。
+
+Host 配置模式（R4 起）：
+
+```powershell
+df-runtime check --config .\runtime.yaml   # 只校验配置与项目编译，不启动调度
+df-runtime run --config .\runtime.yaml     # 启动多实例 Host
+df-runtime version                          # Runtime / Project Format / Engine ABI 版本
+```
+
+Host 控制台命令：`status [id]`、`snapshot <id>`、`stop [id]`、`stop`（停止整个 Host）。退出码：0 正常；2 参数/配置错误；3 项目编译/加载失败；5 运行中不可恢复错误（4 预留给 OPC UA）。
 
 ## 当前不包含
 

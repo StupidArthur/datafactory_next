@@ -360,6 +360,20 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
 - [~] `df-runtime run --config` CLI 入口与多实例 stdin 控制台在 R4 接线；manager 层已就绪。
 - 证据：`doc/engineering/verification-log.md#2026-11-02-r3-验证`。
 
+### 2026-11-02：R4 验证（CLI check / run --config / version / 退出码）
+
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test --workspace` 通过：80 个测试全部通过、0 失败、0 警告（df-core 19、df-core/rust_sdk 集成 3、df-runtime 51+2、df-sdk 3、df-runtime bin cli 2；R4 新增 1 个 config 顺序测试 + 2 个 CLI 参数解析测试）。
+- [x] CFG-01：`df-runtime check --config examples\host\runtime.yaml` 返回 0，列出实例、启用标志与解析后的绝对项目路径（[ok] 标记）。
+- [x] CFG-02：重复实例 ID 在启动前拒绝并明确指出 `duplicate instance id`；结构校验（版本/ID/重复/容量）先于路径解析执行，路径缺失不会掩盖重复 ID。
+- [x] CFG-03：从仓库根与 examples 目录两个不同工作目录分别用相对配置路径执行 check，项目路径均按配置文件目录解析。
+- [x] 退出码：0 正常（check 通过、单实例运行、host 运行后 stop）；2 参数/配置错误（usage、host config 校验失败、重复 ID）；3 项目编译/加载失败（check 单实例编译失败、host 模式全部启用实例启动失败）；5 预留逻辑实现（运行中 Failed → 退出 5，待真实触发场景验证）；4 归 OPC UA（R5）。
+- [x] CLI-02：`df-runtime run <project.dfproject>` 兼容保持（退出 0，status 输出现在含 queue_depth 与 revision）。
+- [x] 多实例会话（INS/CLI-03）：`run --config` 双实例同时 Running 且独立推进；`status`/`status <id>`/`snapshot <id>`/`stop <id>` 正常；停止 tank-a 后 tank-b 继续推进（cycle_index 4→5）；未知命令有警告不中断；`stop` 停止整个 Host，退出码 0；关闭 stdin 亦优雅停止。
+- [x] `df-runtime version`：输出 df-runtime 0.1.0、project format version 3、engine ABI version 1。
+- [~] 退出码 4（OPC UA 启动失败）与运行中退出 5 的真实触发在 R5–R8 随 OPC UA 服务接入后验证。
+- 证据：`doc/engineering/verification-log.md#2026-11-02-r4-验证`。
+
 
 ## 13. Runtime 系统设计基线
 
@@ -369,7 +383,7 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
   - [x] R1 RuntimeHandle / Snapshot revision 与变更通知 / 写入请求状态（Queued/Applying/Applied/Rejected/Cancelled）/ 状态指标补齐（queue_depth、周期开始时间与调度延迟）。（2026-11-02，见 §12 R1 验证记录）
   - [x] R2 Runtime Host 配置结构、严格解析、路径处理与配置预检查（check 命令）。（2026-11-02，check CLI 接线归 R4）
   - [x] R3 RuntimeManager 多实例生命周期与故障隔离。（2026-11-02，多实例 CLI 入口归 R4）
-  - [ ] R4 CLI Host 模式（run --config / check）、多实例状态与优雅停止。
+  - [x] R4 CLI Host 模式（run --config / check）、多实例状态与优雅停止。（2026-11-02）
   - [ ] R5 OPC UA 库 PoC、Endpoint 与安全配置。
   - [ ] R6 Tag Catalog → NodeId/Variant/AccessLevel 映射。
   - [ ] R7 Snapshot 周期发布与订阅通知。

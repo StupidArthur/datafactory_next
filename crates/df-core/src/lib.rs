@@ -12,4 +12,5 @@ pub use compiler::{compile_file, compile_source};
 pub use engine::Engine;
 pub use error::{EngineError, Result};
 pub use format::{ProjectMetadata, Snapshot, TagDescriptor, Value};
+pub use format::{ENGINE_ABI_VERSION, PROJECT_FORMAT_VERSION};
 pub use protocol::{Request, Response};

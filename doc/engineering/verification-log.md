@@ -197,6 +197,60 @@ test result: ok. 3 passed; 0 failed   — df-sdk 单元测试
 ### 3. 边界说明（未验证项）
 
 - 多实例 CLI 入口（`run --config`、stdin 多实例控制台、退出码 2/3）在 R4 接线后做端到端验收。
+
+## 2026-11-02：R4 验证（CLI check / run --config / version / 退出码）
+
+范围：`crates/df-runtime` 新增 `src/cli.rs`（bin 模块），重写 `src/main.rs`；`df-core` 导出 `PROJECT_FORMAT_VERSION`/`ENGINE_ABI_VERSION`。
+
+### 1. 格式与工作区测试
+
+```text
+命令: cargo fmt --all -- --check
+结果: 通过（退出码 0）
+
+命令: cargo test --workspace
+结果: 通过（退出码 0，无警告）
+
+test result: ok. 19 passed; 0 failed  — df-core 单元测试
+test result: ok. 3 passed; 0 failed   — df-core Rust SDK 集成测试
+test result: ok. 51 passed; 0 failed  — df-runtime 单元测试（R3 后 50 + R4 新增 1 个 config 顺序测试）
+test result: ok. 2 passed; 0 failed   — df-runtime host_config 集成测试
+test result: ok. 2 passed; 0 failed   — df-runtime bin cli 参数解析测试
+test result: ok. 3 passed; 0 failed   — df-sdk 单元测试
+合计: 80 passed / 0 failed
+```
+
+### 2. R4 新增测试
+
+- config.rs `structural_errors_are_reported_before_path_errors`：两个实例重复 ID 且项目文件均缺失时，错误先报 `duplicate instance id`（CFG-02 不被路径错误掩盖）。
+- cli.rs `parses_all_command_forms` / `rejects_incomplete_arguments_with_usage`：run/check --config/run --config/version 全部形式与 9 组非法参数（含 `run --config` 缺值不误判为单项目名）。
+
+### 3. Windows 端到端（真实 CLI 进程）
+
+```text
+version:        df-runtime 0.1.0 / project format version 3 / engine ABI version 1（exit 0）
+check (CFG-01): examples\host\runtime.yaml → 列出 tank-a/tank-b 绝对项目路径 [ok]（exit 0）
+check (CFG-03): 分别在仓库根与 examples 目录用相对配置路径执行，均按配置目录解析（exit 0）
+check (CFG-02): 重复 ID（即使项目文件缺失）→ "duplicate instance id \"same\""（exit 2）
+check (exit 3): 存在但损坏的 YAML → 实例标 [FAILED: cannot compile project source ...]（exit 3）
+bad args:       usage 输出（exit 2）
+
+run --config（双实例会话）:
+  tank-a/tank-b 同时 Running，2 秒各推进 4 周期，revision=4，overruns=0
+  status tank-a / snapshot tank-b 正常输出
+  stop tank-a → tank-a Stopped；tank-b 继续推进至 cycle_index=5（故障隔离）
+  未知命令 → stderr 警告，会话继续
+  stop → "runtime host stopped"（exit 0）
+
+run <project.dfproject>（CLI-02 兼容）: 4 周期 / 2s，status 含 queue_depth/revision，stop 退出 0
+run --config（全部启用实例启动失败）: "all enabled instances failed to start"（exit 3）
+```
+
+### 4. 边界说明（未验证项）
+
+- 退出码 4（OPC UA 启动失败）在 R5 接入 UA Server 后验证；退出码 5（运行中不可恢复错误）的触发路径已实现（stop 时检查 Failed 状态），但未构造真实引擎致命错误场景做端到端触发。
+- Ctrl+C 信号路径依赖控制台环境，当前以 stdin 关闭与 stop 命令覆盖优雅停止语义（CLI-03 的两条可达路径）。
+
 - 注册表锁边界（§5.2「模型执行不持有注册表锁」）由实现结构保证（锁只在查找/簿记时持有，加载与执行在锁外），未构造并发压力场景专项测试。
 
 
