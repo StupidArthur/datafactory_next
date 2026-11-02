@@ -741,7 +741,7 @@ async fn stopped_instances_reject_writes_and_pending_batches_are_discarded() {
     );
     assert_eq!(fixture.runtime.handle().queue_depth(), 1);
 
-    fixture.runtime.stop();
+    fixture.runtime.stop().unwrap();
 
     // The queued batch was never applied: the snapshot still carries the
     // initial 0.0012.
@@ -1012,6 +1012,7 @@ async fn opcua_pid_setpoint_controls_valve_and_two_tank_levels() {
     let pid_mv = fixture.tag("pid2.MV");
     let valve_target = fixture.tag("valve_1.target_opening");
     let valve_opening = fixture.tag("valve_1.current_opening");
+    let valve_flow = fixture.tag("valve_1.outlet_flow");
     let tank_1_level = fixture.tag("tank_1.level");
     let tank_2_level = fixture.tag("tank_2.level");
 
@@ -1029,6 +1030,7 @@ async fn opcua_pid_setpoint_controls_valve_and_two_tank_levels() {
         "pid2.MV",
         "valve_1.target_opening",
         "valve_1.current_opening",
+        "valve_1.outlet_flow",
         "tank_1.level",
         "tank_2.level",
     ] {
@@ -1048,6 +1050,7 @@ async fn opcua_pid_setpoint_controls_valve_and_two_tank_levels() {
         pid_mv.clone(),
         valve_target.clone(),
         valve_opening.clone(),
+        valve_flow.clone(),
         tank_1_level.clone(),
         tank_2_level.clone(),
     ];
@@ -1059,6 +1062,7 @@ async fn opcua_pid_setpoint_controls_valve_and_two_tank_levels() {
         "pid2.MV",
         "valve_1.target_opening",
         "valve_1.current_opening",
+        "valve_1.outlet_flow",
         "tank_1.level",
         "tank_2.level",
     ]
@@ -1076,8 +1080,9 @@ async fn opcua_pid_setpoint_controls_valve_and_two_tank_levels() {
     let initial_mv = as_double(&initial[3]);
     let initial_target = as_double(&initial[4]);
     let initial_opening = as_double(&initial[5]);
-    let initial_tank_1 = as_double(&initial[6]);
-    let initial_tank_2 = as_double(&initial[7]);
+    let initial_flow = as_double(&initial[6]);
+    let initial_tank_1 = as_double(&initial[7]);
+    let initial_tank_2 = as_double(&initial[8]);
 
     assert!(
         (initial_setpoint - 0.0970642201834862).abs() < 1e-6,
@@ -1087,6 +1092,26 @@ async fn opcua_pid_setpoint_controls_valve_and_two_tank_levels() {
         (initial_pv - initial_tank_2).abs() < 1e-3,
         "PID PV must reflect the measured second-tank level"
     );
+
+    // Confirm the actual OPC UA write boundary for the process/status tags,
+    // not only the compiler catalog metadata.
+    for (name, node) in [
+        ("pid2.SV", &pid_sv),
+        ("pid2.PV", &pid_pv),
+        ("pid2.MV", &pid_mv),
+        ("valve_1.target_opening", &valve_target),
+        ("valve_1.current_opening", &valve_opening),
+        ("valve_1.outlet_flow", &valve_flow),
+        ("tank_1.level", &tank_1_level),
+        ("tank_2.level", &tank_2_level),
+    ] {
+        let status = write_one(&session, node, double_value(0.0)).await;
+        assert_eq!(
+            status,
+            opcua::types::StatusCode::BadNotWritable,
+            "{name} must reject direct OPC UA writes"
+        );
+    }
 
     // Step the external setpoint up. Good is returned only after the Runtime
     // confirms the write at an Engine cycle boundary.
@@ -1122,6 +1147,14 @@ async fn opcua_pid_setpoint_controls_valve_and_two_tank_levels() {
         |value| value > initial_opening + 10.0,
     )
     .await;
+    let raised_flow = wait_for_double_condition(
+        &session,
+        &valve_flow,
+        Duration::from_secs(5),
+        "valve outlet flow to follow the increased actual opening",
+        |value| value > initial_flow + 0.0001,
+    )
+    .await;
     let raised_tank_1 = wait_for_double_condition(
         &session,
         &tank_1_level,
@@ -1155,6 +1188,7 @@ async fn opcua_pid_setpoint_controls_valve_and_two_tank_levels() {
             pid_mv.clone(),
             valve_target.clone(),
             valve_opening.clone(),
+            valve_flow.clone(),
         ],
     )
     .await;
@@ -1163,6 +1197,7 @@ async fn opcua_pid_setpoint_controls_valve_and_two_tank_levels() {
     let high_mv = as_double(&high_values[2]);
     let high_target = as_double(&high_values[3]);
     let high_opening = as_double(&high_values[4]);
+    let high_flow = as_double(&high_values[5]);
     assert!((high_mv - high_target).abs() < 1e-9);
 
     // Step the setpoint down. PID output and valve target respond first;
@@ -1200,8 +1235,17 @@ async fn opcua_pid_setpoint_controls_valve_and_two_tank_levels() {
     )
     .await;
 
+    let lowered_flow = wait_for_double_condition(
+        &session,
+        &valve_flow,
+        Duration::from_secs(10),
+        "valve outlet flow to decrease after the setpoint is lowered",
+        |value| value < high_flow - 0.00005,
+    )
+    .await;
+
     println!(
-        "PID_CLOSED_LOOP_EVIDENCE initial={{setpoint:{initial_setpoint:.6},pv:{initial_pv:.6},mv:{initial_mv:.3},valve:{initial_opening:.3},tank1:{initial_tank_1:.6},tank2:{initial_tank_2:.6}}} step_up_response={{setpoint:0.400000,pv:{raised_pv:.6},mv:{raised_mv:.3},target:{raised_target:.3},opening:{raised_opening:.3},tank1:{raised_tank_1:.6},tank2:{raised_tank_2:.6}}} step_up_followup={{mv:{high_mv:.3},target:{high_target:.3},opening:{high_opening:.3}}} step_down={{setpoint:0.200000,mv:{lowered_mv:.3},target:{lowered_target:.3},opening:{lowered_opening:.3}}}"
+        "PID_CLOSED_LOOP_EVIDENCE initial={{setpoint:{initial_setpoint:.6},pv:{initial_pv:.6},mv:{initial_mv:.3},valve:{initial_opening:.3},flow:{initial_flow:.6},tank1:{initial_tank_1:.6},tank2:{initial_tank_2:.6}}} step_up_response={{setpoint:0.400000,pv:{raised_pv:.6},mv:{raised_mv:.3},target:{raised_target:.3},opening:{raised_opening:.3},flow:{raised_flow:.6},tank1:{raised_tank_1:.6},tank2:{raised_tank_2:.6}}} step_up_followup={{mv:{high_mv:.3},target:{high_target:.3},opening:{high_opening:.3},flow:{high_flow:.6}}} step_down={{setpoint:0.200000,mv:{lowered_mv:.3},target:{lowered_target:.3},opening:{lowered_opening:.3},flow:{lowered_flow:.6}}}"
     );
 
     session.disconnect().await.unwrap();
