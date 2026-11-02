@@ -1,9 +1,9 @@
 #![cfg(feature = "opcua")]
 
-//! R8 closed-loop write integration tests (design §8, §14.5 WR-01..WR-09,
-//! §9.1 SEC-04).
+//! OPC UA integration tests for write semantics and closed-loop control
+//! (design §8, §9.1 SEC-04, §14.5 WR-01..WR-09 and CL-01/CL-02).
 //!
-//! Four scenarios over real engines, a real `SignAndEncrypt` server with
+//! Seven scenarios over real engines, a real `SignAndEncrypt` server with
 //! configured users (username/password over None is refused by §9.1) and
 //! independent clients:
 //!
@@ -1016,7 +1016,11 @@ async fn opcua_pid_setpoint_controls_valve_and_two_tank_levels() {
     let tank_2_level = fixture.tag("tank_2.level");
 
     assert!(
-        fixture.index.tag(INSTANCE, "level_setpoint").unwrap().writable,
+        fixture
+            .index
+            .tag(INSTANCE, "level_setpoint")
+            .unwrap()
+            .writable,
         "the external setpoint must be writable"
     );
     for read_only_tag in [
