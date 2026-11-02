@@ -1,127 +1,80 @@
-# Runtime / OPC UA 下一轮 Agent 入口
+# Runtime / OPC UA 已实现基线与后续工作入口
 
-> 本文是下一轮 Agent 的执行入口。目标是完成第一轮可运行、可复现的专利实施验证，不是把 Runtime 做成完整工业产品。  
-> 基线 Commit：`2dcba94687f53f0bf0d7e84e4aed5fdba071593a`（`main`，2026-11-02）
+> 本文用于下一轮 Agent 接续工作。Runtime 多实例、OPC UA 写入和 R9 双实例闭环与 PID 设定值闭环补充实施例已有可复现工程证据；后续重点转为双时间对照、客户端验收补齐和产品/专利材料整理，不默认继续扩展 Runtime 功能。  
+> 主线基线 Commit：`456723421b58c927bda421d40f36210eaf4c72a2`（PR #3 已合并，包含 PID 闭环补充实施例）；代码/测试源提交：`ddec2a2ece80c89ec7ec5130d9761107a9a20aa6`。  
+> 第一版技术证据索引：`doc/engineering/runtime-opcua-evidence-map.md`。
 
-## 1. 本轮目标与边界
+## 1. 第一轮完成状态
 
-先完成 R8 的必要修正和验收，再做最小 R9 闭环验证。只实现证明核心技术路线所需的功能：
+- R8-A：Windows 路径规范化已修复。相对路径仍以 Host 配置文件目录为基准，去除拼接结果中的 `.` 路径组件；短名 / 长名 Windows 临时目录均完成本地复验。
+- R8-B：OPC UA Write Handler 已按实例分组。同一实例内任一已知 Tag 写入非法，该实例合法项整批不提交；其他实例的合法批次独立提交。跨实例事务原子性不作承诺。
+- R9：完成双水箱双实例最小闭环。两个独立 Engine / Runtime、一个 SignAndEncrypt Server、两个独立 Client Session；A 的 plant_inlet_flow 写入经 Engine 确认后驱动 tank_1.level 变化；B 的输入和 Engine 快照保持独立。
+- PID 闭环补充实施例：新增外部 `level_setpoint` → PID → 阀门 → 双水箱 → PID PV 工程和真实 OPC UA Client 测试；上调/下调设定值时，PID 输出、阀门开度与出口流量按预期响应，两个水箱液位变化。
+- 代码、测试和实际验证记录以 `doc/engineering/verification-log.md` 的 R8–R9 与 PID 闭环补充实施例条目为准；专利技术特征—代码—测试—实施例映射见 `doc/engineering/runtime-opcua-evidence-map.md`。
 
-- Runtime 管理多个独立实例。
-- OPC UA 客户端读取实例 Tag。
-- OPC UA 写入经过 Runtime 写入队列，在 Engine 周期边界生效。
-- 能用自动化测试证明写入、模型响应和实例隔离。
+## 2. CI 与本地验证边界
 
-**不做产品化扩展**：本轮不实现 Monitor、报警、历史归档、Windows Service、通用诊断平台、额外协议、性能压测或复杂运维能力；不重构现有架构，不增加非必要依赖。
+默认工作区 CI：
 
-## 2. 当前代码与验收状态
+- [R8-A / R8-B 默认 CI #41417657194](https://github.com/StupidArthur/datafactory_next/actions/runs/41417657194)
+- [R8 修正记录 CI #41418883892](https://github.com/StupidArthur/datafactory_next/actions/runs/41418883892)
+- [R9 记录 Commit CI #41419403497](https://github.com/StupidArthur/datafactory_next/actions/runs/41419403497)
+- [PID 闭环补充实施例默认工作区 CI #41437587420](https://github.com/StupidArthur/datafactory_next/actions/runs/41437587420)
+- [PID 闭环补充实施例 Windows OPC UA 专项 CI #41437587512](https://github.com/StupidArthur/datafactory_next/actions/runs/41437587512)
 
-- R1–R8 代码已在上述 Commit 中。R8 尚未正式验收，不要把文档中的本地测试记录等同于 CI 通过。
-- 当前 GitHub Actions：  
-  [Rust CI #41399825148](https://github.com/StupidArthur/datafactory_next/actions/runs/41399825148)
-  - Ubuntu：通过。
-  - Windows：失败，失败发生在 `df-runtime` 的 3 个配置路径测试。
-- Windows 失败的测试：
-  - `config::tests::relative_paths_resolve_against_config_dir_not_cwd`
-  - `config::tests::opcua_cert_paths_resolve_against_config_dir`
-  - `config::tests::valid_config_uses_declared_and_default_values`
-- 已知断言差异：实际路径包含 `./`，期望路径经过 Windows 短路径形式（例如 `RUNNER~1`）；失败表现为路径字符串表示不同。修复时要保证“相对路径始终以配置文件目录为基准”，不能简单删除测试、忽略断言或改变路径基准。
-- 当前 CI 工作流执行默认 `cargo test --workspace --locked`，没有启用 `opcua` feature。R8 的 OPC UA feature 本地验证记录在 `doc/engineering/verification-log.md`，但不要把它说成已由当前 CI 覆盖。
+默认 `.github/workflows/rust-ci.yml` 在 Ubuntu / Windows 执行格式检查、Engine 构建和 `cargo test --workspace --locked`，不启用 `opcua` feature。新增的 `.github/workflows/runtime-opcua-pid-e2e.yml` 只在 Windows 上执行一个指定的 OPC UA PID 集成测试。
 
-## 3. 立即处理：R8 最小修正
+必须区分：
 
-### R8-A：修复 Windows 路径测试
+- R8-A Windows 路径修复：有双平台默认 CI 证据。
+- R8-B OPC UA 跨实例批次测试：Windows 本地 feature 测试证据，不是 CI 覆盖。
+- R9 双实例闭环：Windows 本地 feature 测试证据，不是 CI 覆盖。
+- PID 设定值闭环补充实施例：Windows 单项 feature CI 已通过；不代表完整 OPC UA feature 测试电池或 Ubuntu feature 覆盖。
 
-1. 检查 `crates/df-runtime/src/config.rs` 的路径解析和三个失败测试。
-2. 修复路径规范化或测试比较方式，使其正确处理 Windows 的 `.` 路径段、大小写和短/长路径表示。
-3. 保留相对路径以配置文件目录为基准的行为。
-4. 不允许通过跳过测试、平台屏蔽或放宽到“不检查路径”的方式消除失败。
-
-### R8-B：修正多实例请求的批次边界
-
-设计依据：`doc/runtime-system-design.md` §8.3。**原子性以实例为边界，不以整个 OPC UA Write 请求为边界。**
-
-期望行为：
-
-- 同一实例的一组 Tag 写入合并为一个批次；该实例内任一 Tag 无效，则该实例的合法写入也不得部分生效。
-- 一个 OPC UA 请求包含多个实例时，各实例独立处理；实例 A 的无效写入不能阻止实例 B 的合法批次提交。
-- 不承诺跨实例事务原子性。
-- 响应状态应能区分具体无效项、同实例批次中未提交的合法项，以及其他实例独立批次的结果。
-
-只调整必要的分组、校验和提交逻辑；不要引入通用事务框架。
-
-至少增加一个有代表性的 OPC UA 集成测试：同一个请求覆盖两个实例，实例 A 内包含一项非法写入，实例 B 包含合法写入；验证 A 不发生部分应用、B 仍能在 Engine 周期边界生效。测试可复用现有 `opcua_write.rs` fixture 和客户端辅助函数。
-
-### R8-C：写入状态查询的本轮边界
-
-Runtime 内部已有 `WriteTicket::request_id()`、`RuntimeHandle::write_state(request_id)`。第一轮不新增 OPC UA 诊断节点、查询服务或独立诊断 API，也不为此扩展配置模型。
-
-- 保留现有 Runtime 内部请求状态能力。
-- OPC UA 正常写入仍以 Engine 确认后返回 Good 为准。
-- `BadTimeout` 仍表示结果不确定，不能解释为写入必然失败；本轮测试应使用合理周期和等待时间验证正常闭环。
-- 将“客户端通过 OPC UA 查询超时写入最终状态”明确记录为后续增强，不作为本轮 R8/R9 的阻塞项。
-
-## 4. R8 通过后：最小 R9 闭环
-
-只做一个可复现的双水箱代表性场景，不扩展成通用测试平台：
-
-1. 启动两个独立 Runtime 实例，加载双水箱项目。
-2. 使用独立 OPC UA Client Session 连接服务端并读取两实例的 Tag。
-3. 向实例 A 的一个可写输入写入合法值。
-4. 验证写服务在 Engine 确认生效后返回 Good；随后读取到该输入值，并观察到双水箱模型的相关输出发生预期变化。
-5. 验证实例 B 的对应状态不受实例 A 写入影响。
-6. 停止服务和实例，确认测试资源被正常释放。
-
-优先复用现有测试 fixture、客户端函数和双水箱项目。若现有 R8 集成测试已经覆盖某一项，只补缺失证据，不重复造测试框架。无需额外启动 Studio，也无需构建完整外部进程编排系统。
-
-## 5. 测试策略：短、小、针对性
-
-研发效率优先。先运行单个失败测试，再运行相关小范围测试；不要反复运行全量测试。
-
-建议命令：
+R9 的聚焦命令：
 
 ```bash
 cargo fmt --all -- --check
-
-# 在 Windows 上逐个复验当前失败项
-cargo test -p df-runtime --lib config::tests::relative_paths_resolve_against_config_dir_not_cwd
-cargo test -p df-runtime --lib config::tests::opcua_cert_paths_resolve_against_config_dir
-cargo test -p df-runtime --lib config::tests::valid_config_uses_declared_and_default_values
-
-# 只运行新增/修改的 OPC UA 集成测试；将 <test_name> 替换为实际测试名
-cargo test -p df-runtime --features opcua --test opcua_write <test_name>
-
-# 代码完成后，全工作区默认测试只运行一次
-cargo test --workspace --locked
+cargo test -p df-runtime --features opcua --test opcua_write
 ```
 
-约束：
+结果：6 passed / 0 failed。
 
-- 不运行约 62 秒的完整 OPC UA feature 测试电池，除非用户明确要求。
-- 不增加 Ubuntu/Windows 双平台全量 OPC UA feature 测试矩阵。
-- 不做长时间压力测试、性能基准或重复全量回归。
-- 最终至少确认当前 Windows 默认 CI 失败项已修复，并用一个聚焦 OPC UA 集成测试验证多实例批次边界和闭环关键路径。
+PID 闭环补充实施例的聚焦命令：
 
-## 6. 完成标准与交付
+```bash
+cargo test --locked -p df-runtime --features opcua --test opcua_write opcua_pid_setpoint_controls_valve_and_two_tank_levels -- --exact --nocapture
+```
 
-满足以下条件才报告 R8/R9 本轮完成：
+结果：1 passed / 0 failed（24.86 s，Windows）。专项 CI 先检查目标测试存在，再执行该测试。R8-B 和 R9 的本地 feature 结果不得写成 CI 覆盖；PID 补充实施例的单项 Windows CI 也不得写成完整双平台 OPC UA CI。
 
-- 三个 Windows 路径测试通过，且相对路径基准语义未改变。
-- 多实例写入按实例独立处理；同实例批次仍保持原子性。
-- 聚焦的 OPC UA 双实例测试通过，能证明实例 A 写入、模型响应和实例 B 隔离。
-- 当前默认工作区 CI 在 Ubuntu、Windows 均通过。注意：当前 CI 仅执行默认 feature 的 `cargo test --workspace --locked`，没有启用 `opcua` feature；因此它只能证明默认构建/测试通过，不能证明 R8-B 的 OPC UA 集成测试已被 CI 覆盖。R8-B 的聚焦 OPC UA 测试结果必须单独标注为本地验证证据。
-- `TODO.md` 和 `verification-log.md` 只记录实际执行并通过的项目；未验证项继续标为未完成或明确标注边界。
-- 提交范围只包含必要代码、测试和验证记录；不顺手整理无关模块。
+## 3. 后续工作目标
 
-完成后向用户汇报：改动文件、关键行为、实际执行的短测试命令及结果、Commit SHA、尚未实现的边界。**不要仅凭本地口头总结宣布验收通过，也不要在 R8 未通过前开始 R9。**
+优先整理证据和产品说明，不为“看起来完整”而扩展 Runtime：
 
-## 7. 必读文件（只读相关章节）
+1. **Fast / Realtime 对照。** 对同一 YAML、初始条件、输入序列和 cycle_index 比较 Fast/Offline 与 Realtime 的模型值，明确数值容差；没有结果前不能宣称两种模式已完成一致性验证。
+2. **OPC UA 客户端验收补齐。** 独立客户端 Browse（UA-02）、BOOL / INT64 / FLOAT64 / STRING 完整类型矩阵（UA-05）、未受信客户端证书拒绝（SEC-03）。
+3. **CL-03 需求决策。** Runtime 内部已有 WriteReceipt / effective_cycle_index；客户端查询接口尚不存在。只有明确用户场景和安全边界后再设计 OPC UA 诊断查询，不要直接把内部状态暴露出去。
+4. **性能与长稳证据。** 先确定目标机器、实例数、Tag / Node 数和周期，再采集 CPU、内存、周期耗时、overrun、P95 / P99；没有实测数据前不声明容量上限。
+5. **产品文档。** 以已实现代码和证据为准编写 Runtime / OPC UA 产品说明、双水箱案例说明；把已实现、部分验证、规划能力分开描述。
 
-- `doc/runtime-system-design.md`：§8.3–8.5、§9.1–9.3、§12.2、§14.5。
-- `doc/TODO.md`：R8/R9 进度及实施记录。
-- `doc/engineering/verification-log.md`：R8 验证记录。
-- `crates/df-runtime/src/config.rs`：路径解析与配置测试。
-- `crates/df-runtime/src/opcua/write.rs`：OPC UA 写入校验、分组和提交。
-- `crates/df-runtime/tests/opcua_write.rs`：现有真实客户端集成测试。
+## 4. 当前不能宣称完成的事项
 
-本入口文档优先约束本轮工作范围：以最小实现形成可复现的专利实施证据，不把后续产品化能力提前塞进本轮。
+- Fast / Offline 与 Realtime 同输入序列的数值一致性专门对照。
+- PID 阶跃后的液位收敛时间、稳态误差、长期稳定性和实物整定结果。
+- OPC UA 客户端查询写入最终状态 / effective_cycle_index（CL-03）。
+- 完整 Browse 层级（UA-02）和完整客户端类型矩阵（UA-05）。
+- OPC UA 标准 Write 请求的取消入口；当前取消能力仅在 Runtime 内部 Queued 阶段。
+- 完整 PKI 未受信证书拒绝测试（SEC-03）。
+- 30 分钟长稳、目标规模性能与受支持实例容量声明。
+- 完整 OPC UA feature 测试电池的 Ubuntu / Windows CI 覆盖（目前只有 Windows 单项 PID 测试）。
+
+## 5. 必读文件
+
+- `doc/engineering/runtime-opcua-evidence-map.md`：第一版技术特征、代码、测试、实施例和证据边界映射。
+- `doc/runtime-system-design.md`：设计基线和验收编号；尤其 §6–§9、§14、§17。
+- `doc/engineering/verification-log.md`：R1–R9 与 PID 闭环补充实施例的实际验证命令、结果和未覆盖项。
+- `doc/TODO.md`：专利证据与产品化任务状态。
+- `crates/df-runtime/src/` 与 `crates/df-runtime/tests/`：以当前基线代码和测试为准。
+
+**执行约束：** 不把设计目标写成已实现事实；区分 R8-B/R9 本地 feature 证据与 PID 补充实施例 Windows 单项 feature CI；不把 PID 阶跃响应扩大描述为液位已收敛或实物整定完成；不先做 Monitor、报警、历史归档等非核心扩展。
