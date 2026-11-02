@@ -1139,6 +1139,14 @@ async fn opcua_pid_setpoint_controls_valve_and_two_tank_levels() {
     )
     .await;
 
+    let raised_pv = wait_for_double_condition(
+        &session,
+        &pid_pv,
+        Duration::from_secs(5),
+        "PID process value to follow the rising second-tank level",
+        |value| value > initial_pv + 0.01,
+    )
+    .await;
     let high_values = read_values(
         &session,
         &[
@@ -1193,7 +1201,7 @@ async fn opcua_pid_setpoint_controls_valve_and_two_tank_levels() {
     .await;
 
     println!(
-        "PID_CLOSED_LOOP_EVIDENCE initial={{setpoint:{initial_setpoint:.6},pv:{initial_pv:.6},mv:{initial_mv:.3},valve:{initial_opening:.3},tank1:{initial_tank_1:.6},tank2:{initial_tank_2:.6}}} step_up={{setpoint:0.400000,mv:{raised_mv:.3},target:{raised_target:.3},opening:{raised_opening:.3},tank1:{raised_tank_1:.6},tank2:{raised_tank_2:.6}}} step_down={{setpoint:0.200000,mv:{lowered_mv:.3},target:{lowered_target:.3},opening:{lowered_opening:.3}}}"
+        "PID_CLOSED_LOOP_EVIDENCE initial={{setpoint:{initial_setpoint:.6},pv:{initial_pv:.6},mv:{initial_mv:.3},valve:{initial_opening:.3},tank1:{initial_tank_1:.6},tank2:{initial_tank_2:.6}}} step_up={{setpoint:0.400000,pv:{raised_pv:.6},mv:{raised_mv:.3},target:{raised_target:.3},opening:{raised_opening:.3},tank1:{raised_tank_1:.6},tank2:{raised_tank_2:.6}}} step_down={{setpoint:0.200000,mv:{lowered_mv:.3},target:{lowered_target:.3},opening:{lowered_opening:.3}}}"
     );
 
     session.disconnect().await.unwrap();
