@@ -44,21 +44,31 @@ fn run_project(project_path: &str) -> Result<(), String> {
                     status.last_execution_duration, status.max_execution_duration,
                     status.overrun_count, status.missed_deadlines, status.rejected_write_batches
                 );
-                if let Some(error) = status.last_error { println!("last_error={error}"); }
-                if let Some(error) = status.last_write_error { println!("last_write_error={error}"); }
+                if let Some(error) = status.last_error {
+                    println!("last_error={error}");
+                }
+                if let Some(error) = status.last_write_error {
+                    println!("last_write_error={error}");
+                }
             }
             "snapshot" => {
                 let snapshot = runtime.snapshot();
-                println!("cycle_index={} simulation_time={}s values={:?}",
-                    snapshot.cycle_index, snapshot.simulation_time, snapshot.values);
+                println!(
+                    "cycle_index={} simulation_time={}s values={:?}",
+                    snapshot.cycle_index, snapshot.simulation_time, snapshot.values
+                );
             }
             "stop" => break,
             command => eprintln!("unknown command: {command}; expected status, snapshot or stop"),
         }
-        if runtime.status().state == RuntimeState::Failed { break; }
+        if runtime.status().state == RuntimeState::Failed {
+            break;
+        }
     }
 
-    runtime.stop().map_err(|error| format!("runtime stopped with error: {error}"))?;
+    runtime
+        .stop()
+        .map_err(|error| format!("runtime stopped with error: {error}"))?;
     println!("runtime stopped");
     Ok(())
 }
