@@ -109,7 +109,7 @@ cargo test --workspace --locked
 - 三个 Windows 路径测试通过，且相对路径基准语义未改变。
 - 多实例写入按实例独立处理；同实例批次仍保持原子性。
 - 聚焦的 OPC UA 双实例测试通过，能证明实例 A 写入、模型响应和实例 B 隔离。
-- 当前默认工作区 CI 在 Ubuntu、Windows 均通过。
+- 当前默认工作区 CI 在 Ubuntu、Windows 均通过。注意：当前 CI 仅执行默认 feature 的 `cargo test --workspace --locked`，没有启用 `opcua` feature；因此它只能证明默认构建/测试通过，不能证明 R8-B 的 OPC UA 集成测试已被 CI 覆盖。R8-B 的聚焦 OPC UA 测试结果必须单独标注为本地验证证据。
 - `TODO.md` 和 `verification-log.md` 只记录实际执行并通过的项目；未验证项继续标为未完成或明确标注边界。
 - 提交范围只包含必要代码、测试和验证记录；不顺手整理无关模块。
 
@@ -120,8 +120,8 @@ cargo test --workspace --locked
 - `doc/runtime-system-design.md`：§8.3–8.5、§9.1–9.3、§12.2、§14.5。
 - `doc/TODO.md`：R8/R9 进度及实施记录。
 - `doc/engineering/verification-log.md`：R8 验证记录。
-- `crates/df-runtime/src/config.rs)：路径解析与配置测试。
-- `crates/df-runtime/src/opcua/write.rs)：OPC UA 写入校验、分组和提交。
+- `crates/df-runtime/src/config.rs`：路径解析与配置测试。
+- `crates/df-runtime/src/opcua/write.rs`：OPC UA 写入校验、分组和提交。
 - `crates/df-runtime/tests/opcua_write.rs`：现有真实客户端集成测试。
 
 本入口文档优先约束本轮工作范围：以最小实现形成可复现的专利实施证据，不把后续产品化能力提前塞进本轮。
