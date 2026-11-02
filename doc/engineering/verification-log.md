@@ -707,7 +707,7 @@ step_down (setpoint=0.200000):
 
 ### 4. 执行结果与 CI
 
-代码与测试 Commit：`ddec2a2ece80c89ec7ec5130d9761107a9a20aa6`
+代码与测试源提交：`ddec2a2ece80c89ec7ec5130d9761107a9a20aa6`（PR #3 分支）；主线合并 Commit：`456723421b58c927bda421d40f36210eaf4c72a2`（PR #3 squash merge）。
 
 ```text
 cargo fmt --all -- --check

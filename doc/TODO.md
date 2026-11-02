@@ -253,11 +253,11 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
 
 ## 9. 专利实施证据与验证
 
-- [ ] 建立“专利技术特征—代码模块—自动化测试—实施例”的对应表。
+- [x] 建立“专利技术特征—代码模块—自动化测试—实施例”的第一版对应表（见 [runtime-opcua-evidence-map.md](engineering/runtime-opcua-evidence-map.md)；尚缺证据见该文档 §5–§6）。
 - [ ] 为组件扩展准备一个新增组件实施例，证明新组件可复用既有模型组织、执行和采集机制。
 - [ ] 为配置驱动组态准备人工编写 YAML 与 Agent 生成 YAML 的对照实施例。
 - [ ] 为双时间机制准备同一模型 Fast/Offline 与 Realtime 运行结果对照。
-- [ ] 为 OPC UA 闭环准备外部 Client 读写及后续周期响应的完整测试记录。
+- [x] 为 OPC UA 闭环准备外部 Client 读写及后续周期响应的完整测试记录（R9 双实例过程输入 + 外部 PID 设定值双水箱闭环补充实施例；详见 verification-log.md）。
 - [ ] 记录数据生成耗时、周期执行耗时、周期超时情况及资源使用情况。
 - [ ] 对相同配置和初始条件的重复运行进行一致性验证；涉及随机组件时明确随机种子和可重复性条件。
 - [ ] 保留关键配置文件、测试脚本、运行日志、结果数据及版本 Commit，形成可复现证据。
@@ -287,7 +287,7 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
 
 ---
 
-**当前执行重点：** Runtime 实时调度层已进入代码实现阶段。先完成该 crate 的编译和测试验收，再实现 Runtime CLI、多组态实例管理，随后接入 OPC UA 闭环。产品说明书和 Agent Skill 仍以完整组件清单为基础，双水箱作为经典案例之一。
+**当前执行重点：** Runtime 实时调度、多实例管理、OPC UA 周期发布与闭环写入，以及 R9 双实例过程输入闭环均已实现；PID 设定值双水箱闭环补充实施例已随 PR #3 合并至 main（`456723421b58c927bda421d40f36210eaf4c72a2`）。后续优先完成 Fast/Realtime 同条件对照，以及基于完整组件清单的产品说明书和 Agent Skill；设计 R10 的 Monitor、报警、历史归档仍是后续维护性工作。
 
 
 ## 12. 实施进度记录
@@ -301,7 +301,7 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
 - [~] 增加最新 Snapshot 发布、运行状态和执行耗时统计。
 - [~] 增加 Cargo 单元测试，全部通过（见下方 2026-11-02 验证记录）。
 - [x] 完成 Cargo 格式检查、工作区编译和全部测试。
-- [~] 在 Windows 环境验证 Runtime 启动、停止和持续运行；真实引擎上的外部写入闭环验收归入 R8/R9（当前 CLI 无写入命令）。
+- [~] 在 Windows 环境验证 Runtime 启动、停止和持续运行；真实引擎上的外部写入闭环验收由 R8/R9 与 PID 闭环补充实施例覆盖（Runtime CLI 本身不提供 OPC UA 写入命令）。
 
 **当前边界：** 目前实现的是单个 Engine 实例的实时调度核心，不包含独立 CLI、多组态实例管理和 OPC UA。后续 OPC UA 必须通过 Runtime 写入队列进入 Engine，不能直接改写模型状态。
 
@@ -313,7 +313,7 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
 - [ ] 增加 Windows 服务/信号优雅停止机制。
 - [ ] 增加 YAML 直接启动流程（内部调用现有 Compiler 生成临时或发布的 dfproject）。
 - [x] 实际执行 cargo fmt --check 和 cargo test --workspace（含全工作区编译；见 2026-11-02 验证记录）。
-- [~] 在 Windows 目标环境验证了真实项目启动、实时推进与优雅停止；写入闭环验收与 R8/R9 一并执行。
+- [~] 在 Windows 目标环境验证了真实项目启动、实时推进与优雅停止；写入闭环验收由 R8/R9 及 PID 闭环补充实施例完成。
 
 
 ### 2026-11-02：Runtime 首轮验证（Windows / rustc 1.99.1 msvc）
@@ -321,7 +321,7 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
 - [x] `cargo fmt --all -- --check` 通过，无格式差异。
 - [x] `cargo test --workspace` 通过：33 个测试全部通过、0 失败（df-core 19、df-core/rust_sdk 集成 3、df-runtime 8、df-sdk 3）。
 - [x] Windows 真实引擎端到端：`df-engine compile` 编译 `examples/two-tank/project.yaml` 后由 `df-runtime run` 启动实时调度；约 2.5 秒墙钟推进 5 个模型周期（cycle_index=5、simulation_time=2.5s，与 cycle_time=0.5s 严格一致；overrun=0、missed_deadlines=0）；tank_1.level 0.1500→0.1767、tank_2.level 0.1000→0.1057，流量沿 plant_inlet_flow→tank_1→tank_2 正确传递；stdin 的 status/snapshot/stop 均正常，进程退出码 0。
-- [~] 真实引擎上的外部写入尚未端到端验证：当前 Runtime CLI 没有写入命令；写入确认/原子拒绝/队列容量/停止拒绝语义目前由 df-runtime 单元测试（FakeEngine）覆盖，真实闭环写入验收归入 R8/R9。
+- [x] 真实引擎上的外部写入已通过 R9 双实例过程输入和 PID 闭环补充实施例完成端到端验证：真实 Engine + Runtime + SignAndEncrypt OPC UA Server + 独立 Writer Client；写入确认、周期生效、模型响应均有测试证据。Runtime CLI 本身不提供 OPC UA 写入命令。
 - [x] 环境修复：移除 datafactory-next 目录上误设的 rustup 目录覆盖（stable-x86_64-pc-windows-gnu；其 TDM-GCC 10.3 链接器缺 libgcc_eh 导致无法链接），恢复默认 stable-x86_64-pc-windows-msvc。
 - 证据：`doc/engineering/verification-log.md#2026-11-02-runtime-首轮验证`；命令与输出以该台账为准。
 
@@ -467,6 +467,7 @@ Studio 已有的组态、仿真、趋势展示和导出能力以现有实现为�
   - [x] R7 Snapshot 周期发布与订阅通知。（2026-11-02，见 §12 R7 验证记录；含 R1 停机协议顺序修复）
   - [x] R8 OPC UA Write Handler、批次聚合、确认与取消。（2026-11-02，见 §12 R8 验证记录；含 CLI 退出码 4/5 接线与首次真实触发；R8 修正与验收见 §12「R8 修正与验收」）
   - [x] R9 双水箱闭环案例与独立客户端自动化测试。（2026-11-02，见 §12 R9 最小闭环验证；CL-03 客户端侧诊断仍为后续增强）
+  - [x] 外部 PID 设定值双水箱闭环补充实施例（对应设计 §14.5 CL-01/CL-02；Windows 单项 OPC UA feature CI 通过；不代表液位已收敛或设计 R10 Monitor 已完成）。
   - [ ] R10 Monitor 指标、报警、归档。
 
 设计文档：[doc/runtime-system-design.md](runtime-system-design.md)
