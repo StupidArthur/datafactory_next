@@ -1,7 +1,7 @@
 # Runtime / OPC UA 已实现基线与后续工作入口
 
 > 本文用于下一轮 Agent 接续工作。Runtime 多实例、OPC UA 写入和 R9 双实例闭环与 PID 设定值闭环补充实施例已有可复现工程证据；后续重点转为双时间对照、客户端验收补齐和产品/专利材料整理，不默认继续扩展 Runtime 功能。  
-> 主线基线 Commit：`456723421b58c927bda421d40f36210eaf4c72a2`（PR #3 已合并，包含 PID 闭环补充实施例）；代码/测试源提交：`ddec2a2ece80c89ec7ec5130d9761107a9a20aa6`。  
+> Runtime / OPC UA 代码实现基线 Commit：`456723421b58c927bda421d40f36210eaf4c72a2`（PR #3 已合并，包含 PID 闭环补充实施例）；代码/测试源提交：`ddec2a2ece80c89ec7ec5130d9761107a9a20aa6`。  
 > 第一版技术证据索引：`doc/engineering/runtime-opcua-evidence-map.md`。
 
 ## 1. 第一轮完成状态
