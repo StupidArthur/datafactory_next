@@ -36,7 +36,7 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --locked
 
-frontend:
+  frontend:
     name: Studio frontend build
     runs-on: ubuntu-latest
     steps:
