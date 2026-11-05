@@ -77,6 +77,9 @@ pub struct OpcUaSecurityConfig {
     pub server_certificate: Option<PathBuf>,
     pub server_private_key: Option<PathBuf>,
     pub trust_list: Option<PathBuf>,
+    /// Explicit test-only relaxation. Default false: production secure endpoints
+    /// require the client's application certificate to be trusted by the server.
+    pub auto_trust_client_certs: bool,
     /// Configured users (§9.1). Passwords are never stored here: each entry
     /// names the environment variable holding the password, resolved when
     /// the server starts (`resolve_user_credentials`).
@@ -92,6 +95,7 @@ impl Default for OpcUaSecurityConfig {
             server_certificate: None,
             server_private_key: None,
             trust_list: None,
+            auto_trust_client_certs: false,
             users: Vec::new(),
         }
     }
@@ -227,6 +231,8 @@ struct RawOpcUaSecurityConfig {
     server_private_key: Option<PathBuf>,
     #[serde(default)]
     trust_list: Option<PathBuf>,
+    #[serde(default)]
+    auto_trust_client_certs: bool,
     #[serde(default)]
     users: Option<Vec<RawOpcUaUserConfig>>,
 }
@@ -574,6 +580,7 @@ impl RawOpcUaSecurityConfig {
             server_certificate,
             server_private_key,
             trust_list,
+            auto_trust_client_certs: self.auto_trust_client_certs,
             users: self
                 .users
                 .unwrap_or_default()
