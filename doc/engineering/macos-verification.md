@@ -28,6 +28,7 @@ ad-hoc 签名不等于 Developer ID 签名或苹果公证；不是已签名可�
 ### Rust Engine / Runtime
 
     cargo build --locked -p df-engine -p df-runtime
+    export PATH="$PWD/target/debug:$PATH"  # SDK/集成测试查找 df-engine
     cargo test --workspace --locked
     cargo run --locked -p df-runtime -- run examples/two-tank/project.yaml
 
