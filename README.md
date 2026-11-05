@@ -53,6 +53,39 @@ $env:DF_ENGINE_PATH = "$PWD/target/debug/df-engine.exe"
 wails dev
 ```
 
+## macOS 开发、测试与打包（Apple Silicon / Intel）
+
+macOS 使用本机架构的 Rust Engine 和 Wails v2 Studio。先安装 Xcode Command Line Tools、Rust stable、Go（按 `go.mod` 的版本要求）、Node.js 22 和 Wails v2：
+
+```bash
+xcode-select --install
+go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+export PATH="$(go env GOPATH)/bin:$PATH"
+
+# 核心计算和实时运行时
+cargo build --locked -p df-engine -p df-runtime
+cargo test --workspace --locked
+
+# Studio 开发模式（显式指向无 .exe 后缀的 Engine）
+export DF_ENGINE_PATH="$PWD/target/debug/df-engine"
+wails dev
+
+# 本机架构打包 .app，将 Rust Engine 一并装入 Contents/MacOS
+bash scripts/build-studio-macos.sh
+open build/bin/datafactory-studio.app
+```
+
+打包脚本会在生成 `.app` 后复制 `df-engine`、执行本地 ad-hoc 签名并校验签名；**不提供面向外部分发的 Apple Developer ID 签名或公证**。脚本在 Apple Silicon 与 Intel 上各自生成对应架构的应用，不是 Universal App。启动时优先使用 `DF_ENGINE_PATH`，否则 Studio 会从其自身可执行文件同级目录寻找 `df-engine`（Windows 为 `df-engine.exe`）。
+
+Runtime / OPC UA 单独验证：
+
+```bash
+cargo run --locked -p df-runtime -- run examples/two-tank/project.yaml
+cargo test --locked -p df-runtime --features opcua --tests
+```
+
+macOS 专项 CI 位于 `.github/workflows/macos-ci.yml`，覆盖 ARM64、Intel 的 Rust、OPC UA、Go、前端及 Studio 打包。CI 不等同于实际 Mac 的 GUI/外部 OPC UA 客户端验收；首次本地运行请按 [macOS 验证记录说明](doc/engineering/macos-verification.md) 检查。
+
 ## 验证
 
 ```powershell

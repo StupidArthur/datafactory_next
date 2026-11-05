@@ -1,0 +1,109 @@
+name: macOS compatibility
+
+on:
+  push:
+    branches:
+      - "feature/**"
+    paths:
+      - "main.go"
+      - "engine_path.go"
+      - "engine_path_test.go"
+      - "scripts/build-studio-macos.sh"
+      - "crates/**"
+      - "studio/**"
+      - "frontend/**"
+      - "go.mod"
+      - "go.sum"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/macos-ci.yml"
+  pull_request:
+    paths:
+      - "main.go"
+      - "engine_path.go"
+      - "engine_path_test.go"
+      - "scripts/build-studio-macos.sh"
+      - "crates/**"
+      - "studio/**"
+      - "frontend/**"
+      - "go.mod"
+      - "go.sum"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/macos-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS Engine / Runtime / Studio (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: amd64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Build Rust Engine
+        run: cargo build --locked -p df-engine --bin df-engine
+      - name: Run Rust workspace tests on macOS
+        run: |
+          echo "$GITHUB_WORKSPACE/target/debug" >> "$GITHUB_PATH"
+          export PATH="$GITHUB_WORKSPACE/target/debug:$PATH"
+          cargo test --workspace --locked
+      - name: Run macOS OPC UA integration tests
+        run: cargo test --locked -p df-runtime --features opcua --tests
+      - name: Build embedded Studio frontend
+        run: |
+          npm ci --prefix frontend
+          npm run build --prefix frontend
+      - name: Go formatting and tests
+        run: |
+          test -z "$(gofmt -l main.go engine_path.go engine_path_test.go)"
+          go test ./...
+      - name: Install Wails v2 CLI
+        run: |
+          go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Package native macOS Studio and sidecar Engine
+        run: bash scripts/build-studio-macos.sh
+      - name: Validate macOS bundle
+        run: |
+          APP=build/bin/datafactory-studio.app
+          test -x "$APP/Contents/MacOS/df-engine"
+          test -f "$APP/Contents/Info.plist"
+          file "$APP/Contents/MacOS/df-engine"
+          codesign --verify --deep --strict "$APP"
+
+      - name: Archive native .app (preserve executable bits)
+        run: |
+          zip -qyr "datafactory-studio-macos-${{ matrix.arch }}.zip" build/bin/datafactory-studio.app
+      - name: Upload macOS Studio test build
+        uses: actions/upload-artifact@v4
+        with:
+          name: datafactory-studio-macos-${{ matrix.arch }}
+          path: datafactory-studio-macos-${{ matrix.arch }}.zip
+          retention-days: 14
