@@ -648,7 +648,7 @@ async fn client_browses_hierarchy_and_reads_bool_int64_float64_string() {
     assert!(objects.contains(&"DataFactory".to_owned()), "{objects:?}");
 
     let index = server.address_space().clone();
-    let root = index.root.expect("DataFactory folder");
+    let root = index.root.clone().expect("DataFactory folder");
     let top = children(session.browse(&[browse(root)], 0, None).await.unwrap());
     assert!(top.contains(&"ServerStatus".to_owned()), "{top:?}");
     assert!(top.contains(&"Instances".to_owned()), "{top:?}");
