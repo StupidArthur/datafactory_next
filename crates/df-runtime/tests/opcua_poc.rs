@@ -585,3 +585,107 @@ async fn secure_channel_with_username_password_auth() {
 
     server.stop();
 }
+
+
+/// UA-02 / UA-05: use a real independent client to browse the published
+/// hierarchy and read each scalar type, rather than only inspecting the
+/// server-side Tag Catalog.
+#[tokio::test]
+async fn client_browses_hierarchy_and_reads_bool_int64_float64_string() {
+    use opcua::types::{BrowseDescription, BrowseDirection};
+
+    let port = free_port();
+    let config = loopback_none_config(port);
+    let tags = [
+        ("flag", "BOOL", Value::Bool(true)),
+        ("counter", "INT64", Value::Int(-41)),
+        ("temperature", "FLOAT64", Value::Float(37.25)),
+        ("message", "STRING", Value::String("ready".into())),
+    ]
+    .into_iter()
+    .map(|(name, data_type, initial)| TagDescriptor {
+        name: name.into(),
+        data_type: data_type.into(),
+        writable: false,
+        unit: String::new(),
+        description: String::new(),
+        initial,
+    })
+    .collect();
+    let catalogs = vec![InstanceCatalog {
+        instance_id: "type-matrix".into(),
+        tags,
+    }];
+    let mut server = OpcUaServer::start_with_catalogs(&config, &catalogs).unwrap();
+    let session = connect_anonymous("ua02_ua05", &config.endpoint_url).await;
+    assert!(session.wait_for_connection().await);
+
+    // HierarchicalReferences (i=33), including Organizes and HasComponent.
+    let browse = |node_id: NodeId| BrowseDescription {
+        node_id,
+        browse_direction: BrowseDirection::Forward,
+        reference_type_id: NodeId::new(0, 33u32),
+        include_subtypes: true,
+        node_class_mask: 0,
+        result_mask: 63,
+    };
+    let children = |results: Vec<opcua::types::BrowseResult>| -> Vec<String> {
+        assert_eq!(results.len(), 1);
+        assert!(results[0].status_code.is_good(), "browse status");
+        results[0]
+            .references
+            .as_ref()
+            .expect("browse references")
+            .iter()
+            .map(|reference| reference.browse_name.name.as_ref().to_string())
+            .collect()
+    };
+    let objects = children(
+        session
+            .browse(&[browse(NodeId::objects_folder_id())], 0, None)
+            .await
+            .unwrap(),
+    );
+    assert!(objects.contains(&"DataFactory".to_owned()), "{objects:?}");
+
+    let index = server.address_space().clone();
+    let root = index.root.expect("DataFactory folder");
+    let top = children(session.browse(&[browse(root)], 0, None).await.unwrap());
+    assert!(top.contains(&"ServerStatus".to_owned()), "{top:?}");
+    assert!(top.contains(&"Instances".to_owned()), "{top:?}");
+
+    let instances = children(
+        session
+            .browse(
+                &[browse(NodeId::new(
+                    server.namespace_index(),
+                    "df/instances",
+                ))],
+                0,
+                None,
+            )
+            .await
+            .unwrap(),
+    );
+    assert!(instances.contains(&"type-matrix".to_owned()), "{instances:?}");
+
+    let folder = index.instances["type-matrix"].tags_folder.clone();
+    let names = children(session.browse(&[browse(folder)], 0, None).await.unwrap());
+    for expected in ["flag", "counter", "temperature", "message"] {
+        assert!(names.contains(&expected.to_owned()), "{expected} not in {names:?}");
+    }
+
+    let ids: Vec<NodeId> = ["flag", "counter", "temperature", "message"]
+        .iter()
+        .map(|name| index.tag("type-matrix", name).unwrap().node_id.clone())
+        .collect();
+    let data = read_values(&session, &ids).await;
+    assert_eq!(data.len(), 4);
+    assert!(matches!(data[0].value, Some(Variant::Boolean(true))));
+    assert!(matches!(data[1].value, Some(Variant::Int64(-41))));
+    assert!(matches!(data[2].value, Some(Variant::Double(value)) if (value - 37.25).abs() < 1e-12));
+    assert_eq!(as_string(&data[3]), "ready");
+
+    session.disconnect().await.unwrap();
+    server.stop();
+}
