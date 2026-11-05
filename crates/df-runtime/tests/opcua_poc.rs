@@ -689,3 +689,79 @@ async fn client_browses_hierarchy_and_reads_bool_int64_float64_string() {
     session.disconnect().await.unwrap();
     server.stop();
 }
+
+
+/// SEC-03: secure clients with unapproved application certificates must not
+/// activate a session. The test client trusts the *server*; the server is
+/// deliberately configured not to trust the test client's certificate.
+#[tokio::test]
+async fn secure_endpoint_rejects_untrusted_client_certificate() {
+    let dir = scratch_dir("sec03_reject");
+    let cert_dir = dir.join("cert");
+    let trust_dir = dir.join("pki");
+    std::fs::create_dir_all(&cert_dir).unwrap();
+    std::fs::create_dir_all(&trust_dir).unwrap();
+    let port = free_port();
+    let config = df_runtime::OpcUaConfig {
+        enabled: true,
+        endpoint_url: format!("opc.tcp://127.0.0.1:{port}"),
+        application_uri: "urn:datafactory:runtime".into(),
+        namespace_uri: "urn:datafactory:runtime:ns".into(),
+        security: df_runtime::OpcUaSecurityConfig {
+            mode: df_runtime::SecurityMode::SignAndEncrypt,
+            policy: df_runtime::SecurityPolicy::Basic256Sha256,
+            allow_anonymous: true,
+            server_certificate: Some(cert_dir.join("server.der")),
+            server_private_key: Some(cert_dir.join("server-key.pem")),
+            trust_list: Some(trust_dir),
+            auto_trust_client_certs: false,
+            users: vec![],
+        },
+        write_wait_timeout_ms: None,
+    };
+    let mut server = OpcUaServer::start_with_catalogs(&config, &[]).unwrap();
+
+    let mut client = ClientBuilder::new()
+        .application_name("Untrusted DataFactory Client")
+        .application_uri("urn:datafactory:untrusted-client")
+        .pki_dir(scratch_dir("sec03_client").join("client_pki"))
+        .create_sample_keypair(true)
+        .trust_server_certs(true)
+        .session_retry_limit(0)
+        .request_timeout(Duration::from_secs(3))
+        .client()
+        .unwrap();
+
+    let endpoint = (
+        config.endpoint_url.as_str(),
+        UaSecurityPolicy::Basic256Sha256.to_str(),
+        MessageSecurityMode::SignAndEncrypt,
+        opcua::types::UserTokenPolicy::anonymous(),
+    );
+    let rejected = tokio::time::timeout(Duration::from_secs(12), async {
+        match client
+            .connect_to_matching_endpoint(endpoint, IdentityToken::Anonymous)
+            .await
+        {
+            Err(_) => true,
+            Ok((session, event_loop)) => {
+                let task = event_loop.spawn();
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(4),
+                    session.wait_for_connection(),
+                )
+                .await;
+                task.abort();
+                !matches!(outcome, Ok(true))
+            }
+        }
+    })
+    .await
+    .expect("untrusted client connection must terminate or time out deterministically");
+
+    assert!(
+        rejected,
+        "untrusted client certificate must not activate an encrypted OPC UA session"
+    );
+    server.stop();
+}
