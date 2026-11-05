@@ -97,3 +97,13 @@ jobs:
           test -f "$APP/Contents/Info.plist"
           file "$APP/Contents/MacOS/df-engine"
           codesign --verify --deep --strict "$APP"
+
+      - name: Archive native .app (preserve executable bits)
+        run: |
+          zip -qyr "datafactory-studio-macos-${{ matrix.arch }}.zip" build/bin/datafactory-studio.app
+      - name: Upload macOS Studio test build
+        uses: actions/upload-artifact@v4
+        with:
+          name: datafactory-studio-macos-${{ matrix.arch }}
+          path: datafactory-studio-macos-${{ matrix.arch }}.zip
+          retention-days: 14
