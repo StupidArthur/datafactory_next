@@ -186,7 +186,6 @@ fn build_server(
         .application_uri(config.application_uri.clone())
         .product_uri("urn:datafactory:runtime")
         .create_sample_keypair(true)
-        .trust_client_certs(true)
         .pki_dir(pki_dir)
         .certificate_path(certificate_path.unwrap())
         .private_key_path(private_key_path.unwrap())
@@ -197,6 +196,12 @@ fn build_server(
             &config.namespace_uri,
             write_state.clone(),
         ));
+
+    // Never auto-trust unknown peer certificates unless an explicitly
+    // configured loopback test fixture requests that relaxation.
+    if config.security.auto_trust_client_certs {
+        builder = builder.trust_client_certs(true);
+    }
 
     for user in users {
         builder = builder.add_user_token(
