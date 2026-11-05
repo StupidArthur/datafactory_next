@@ -253,3 +253,57 @@ cargo test --locked -p df-runtime --features opcua \
 - [ ] 记录所有测试数、通过数、失败数、实际耗时；保留完整日志与失败时端口信息。
 
 **PASS**：三个命令均返回 0，关键测试名称明确显示 passed。若失败不删除测试、不改测试数据掩盖问题；先留证并排查端口、证书、系统权限、时间调度等。
+
+
+## T09 — 独立 OPC UA 客户端：Browse、Read、Subscribe（必测）
+
+**必须使用仓库外的 OPC UA Client**，例如在当前 macOS 上可运行的 UaExpert 版本或其他等效客户端。工具须支持浏览节点、读取、订阅、读写和安全身份设置。记录名称、版本和安装来源；缺少此类工具记 BLOCKED，不能用 T08 的 Rust 测试代替。
+
+这一阶段只使用本机回环地址 127.0.0.1，允许 None/Anonymous **仅用于本机只读连通性验证**；不要开放到局域网，也不能用此配置代替 T10 的加密写入验证。
+
+在一个 Terminal 中执行（沿用 T00 中 DF_TEST_OUT 的绝对路径）：
+
+~~~bash
+export DF_MAC_PKI="$(mktemp -d /tmp/datafactory-mac-pki.XXXXXX)"
+echo "Temporary test PKI: $DF_MAC_PKI"
+cat > "$DF_TEST_OUT/T09-anonymous.yaml" <<EOF
+runtime_version: 1
+opcua:
+  enabled: true
+  endpoint_url: "opc.tcp://127.0.0.1:4840"
+  application_uri: "urn:datafactory:runtime"
+  namespace_uri: "urn:datafactory:runtime:ns"
+  security:
+    mode: None
+    policy: None
+    allow_anonymous: true
+    trust_list: "$DF_MAC_PKI"
+instances:
+  - id: tank-a
+    project: "$PWD/examples/two-tank/pid-closed-loop.yaml"
+    enabled: true
+    scheduler: {overrun_policy: delay, write_queue_capacity: 256}
+  - id: tank-b
+    project: "$PWD/examples/two-tank/pid-closed-loop.yaml"
+    enabled: true
+    scheduler: {overrun_policy: catch_up, write_queue_capacity: 256}
+EOF
+
+./target/debug/df-runtime check --config "$DF_TEST_OUT/T09-anonymous.yaml" \
+  2>&1 | tee "$DF_TEST_OUT/logs/T09-check.log"
+./target/debug/df-runtime run --config "$DF_TEST_OUT/T09-anonymous.yaml" \
+  2>&1 | tee "$DF_TEST_OUT/logs/T09-runtime.log"
+~~~
+
+让 Runtime 终端保持运行。在独立客户端连接 opc.tcp://127.0.0.1:4840，Policy=None、Anonymous，然后逐项操作：
+
+- [ ] 客户端建立 Session，Runtime 日志含 opcua serving at；如果有“built without the opcua feature”，返回 T01 重新构建正确二进制。
+- [ ] 浏览 Objects → DataFactory → Instances，存在 tank-a、tank-b；两实例下都有 Tags、Status。
+- [ ] 读取 tank-a / tank-b 的 CycleTime=0.5、CycleIndex、SimulationTime 和 State。间隔 5 秒再读取，两个实例的 CycleIndex 均增加。
+- [ ] 两实例都能读取 level_setpoint、pid2.SV、pid2.PV、pid2.MV、valve_1.current_opening、tank_1.level、tank_2.level；数值非空、有限，质量码 Good。
+- [ ] 记录实际命名空间索引（不要假定固定为 2）；例如 Tag 的字符串节点标识符应为 df/instances/tank-a/tags/level_setpoint，两实例同名节点的 NodeId 不相同。
+- [ ] 订阅一个实时变化的节点（推荐 CycleIndex），持续至少 30 秒，收到多个新值并记录时间戳。
+- [ ] 以 Anonymous 尝试写 FLOAT64 0.40 到 tank-a/level_setpoint，应返回 BadUserAccessDenied 或其他拒绝码（匿名仅有 Reader 权限）；读取值仍为原值。
+- [ ] 保存浏览树、两实例状态、订阅曲线/表格、写入拒绝码的截图和客户端软件版本。
+
+之后在 Runtime Terminal 输入 stop 并记录正常退出。**PASS**：以上都满足，端点正常释放、证据完整。本节不是加密/授权写入验收。
