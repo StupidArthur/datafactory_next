@@ -162,3 +162,94 @@ open "$APP"
 - [ ] 保存桌面截图、导出文件、构建日志、Codesign 结果。
 
 **PASS**：完整独立应用工作流可用。ad-hoc 签名不等同于 Apple Developer ID 签名/公证，不以这项测试声称可对外发行。
+
+
+## T06 — Runtime CLI：配置校验、双实例状态与快照（必测）
+
+先使用 T01 编译生成的 Runtime（已启用 OPC UA feature；本项使用的示例配置关闭了 OPC UA）。
+
+~~~bash
+./target/debug/df-runtime version 2>&1 | tee "$DF_TEST_OUT/logs/T06-version.log"
+./target/debug/df-runtime check --config examples/host/runtime.yaml \
+  2>&1 | tee "$DF_TEST_OUT/logs/T06-check.log"
+./target/debug/df-runtime run --config examples/host/runtime.yaml \
+  2>&1 | tee "$DF_TEST_OUT/logs/T06-host.log"
+~~~
+
+第三条命令进入交互模式，不要立即关闭。依次输入以下命令，查询两次状态之间实际等待 **5 秒**：
+
+~~~text
+status tank-a
+status tank-b
+snapshot tank-a
+snapshot tank-b
+[等待 5 秒；不要输入本行]
+status tank-a
+status tank-b
+stop
+~~~
+
+- [ ] Host 配置检查显示 tank-a 与 tank-b 两个项目均为 [ok]，没有文件路径或编译错误。
+- [ ] 两实例均报告 Running；周期索引第二次查询大于第一次，仿真时间上升。
+- [ ] 运行项目的 cycle_time 为 0.5 秒；两实例各自拥有状态、队列与周期计数；不要求两个独立周期计数始终完全相同。
+- [ ] 快照包含 tank_1.level / tank_2.level 等真实变量；状态及数值可解析。
+- [ ] 输入 stop 后正常退出，显示 runtime host stopped，退出状态 0。
+- [ ] 在报告记录每个实例的前后两次 cycle_index、simulation_time 和两项液位。
+
+**PASS**：两实例独立正常推进、可读取快照、停止成功，保存交互日志。注意 examples/host/runtime.yaml 的 OPC UA disabled；T06 不代表通信验收。
+
+## T07 — **双实例完整 30 分钟长稳 + CPU/RSS 留证**（必测）
+
+必须连续执行至少 **1800 秒**。不要使用缩短版替代正式测试；Mac 应接电源，并避免睡眠（可以在另一终端运行 caffeinate -dimsu，在测试结束后终止 caffeinate）。
+
+当前 main 的长稳测试脚本为 work/macos_soak.py，自动启动已有双实例 Host；每 30 秒查询各实例状态并记录整体进程的 CPU 和内存 RSS，最后发 stop。
+
+~~~bash
+python3 work/macos_soak.py \
+  --duration-secs 1800 \
+  --sample-secs 30 \
+  --out "$DF_TEST_OUT/T07-soak" \
+  2>&1 | tee "$DF_TEST_OUT/logs/T07-console.log"
+~~~
+
+脚本输出文件：
+
+- T07-soak/runtime.log：Runtime 输出、两实例状态、最终快照和停止日志；
+- T07-soak/resources.csv：elapsed_s、rss_kib、cpu_percent、process_alive；
+- T07-soak/soak-summary.json：总时长、结束码、各实例首末状态、资源峰值、各自动验收门槛及 pass。
+
+**必过指标：**
+
+- [ ] 实测运行时间 >= 1800 秒，Runtime 正常停止，进程退出码 0；没有进程崩溃或 Failed 状态。
+- [ ] tank-a、tank-b 均有连续记录，cycle_index 严格单调增加，simulation_time 与 cycle_index×0.5s 误差 <0.001s。
+- [ ] 两实例最终 cycle_index 均 >=3420，即目标周期 3600 的 95%；这是本次测量的临时最低门槛，不是产品对外实时性能承诺。
+- [ ] 采样大约 60 条，记录 RSS 峰值、CPU 峰值，观察 5 分钟热身后 RSS 首尾均值；脚本提示异常增长时须调查。
+- [ ] soak-summary.json 中所有 gates=true，pass=true；任何 gate 为 false 则记 FAIL 并分析根因。
+- [ ] 记录完成后的两个实例状态及快照；检查是否发生异常重启。
+- [ ] 保存原始 stdout 日志、CSV、JSON。期间测试被人为停止、设备进入休眠或失去电源的，必须重新完整运行。
+
+**PASS**：持续跑满 1800 秒，脚本退出 0、JSON pass=true、证据齐全。CPU 和 RSS 为整个 Host 进程的采样，不代表单实例独立资源。当前采样没有逐周期延迟数据，不能宣称 P95/P99 的真实数值。
+
+## T08 — OPC UA Rust 集成测试全套 + 两项关键回归（必测）
+
+这些测试使用 Rust 测试代码启动真实 OPC UA Server/Client，不要求用户另行安装 UaExpert；但不替代 T09/T10 的独立客户端验证。
+
+~~~bash
+cargo test --locked -p df-runtime --features opcua --tests \
+  -- --nocapture 2>&1 | tee "$DF_TEST_OUT/logs/T08-opcua-all.log"
+
+cargo test --locked -p df-runtime --features opcua \
+  --test opcua_write opcua_pid_setpoint_controls_valve_and_two_tank_levels \
+  -- --exact --nocapture 2>&1 | tee "$DF_TEST_OUT/logs/T08-pid.log"
+
+cargo test --locked -p df-runtime --features opcua \
+  --test opcua_write multi_instance_request_vetoes_one_batch_without_blocking_the_other \
+  -- --exact --nocapture 2>&1 | tee "$DF_TEST_OUT/logs/T08-instance-isolation.log"
+~~~
+
+- [ ] 第一条实际运行含 OPC UA 连接、浏览、订阅、权限、写入、队列、生命周期测试，而非 0 tests。
+- [ ] 第二条实际执行并 PASS：外部 OPC UA PID 设定值驱动阀门与双水箱动态模型；设定值上下阶跃。
+- [ ] 第三条实际执行并 PASS：同一请求中 A 实例批次被否决，不阻止 B 实例有效写入；状态不串扰。
+- [ ] 记录所有测试数、通过数、失败数、实际耗时；保留完整日志与失败时端口信息。
+
+**PASS**：三个命令均返回 0，关键测试名称明确显示 passed。若失败不删除测试、不改测试数据掩盖问题；先留证并排查端口、证书、系统权限、时间调度等。
