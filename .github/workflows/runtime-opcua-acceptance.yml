@@ -23,8 +23,12 @@ permissions:
 
 jobs:
   opcua:
-    name: OPC UA integration suite (Windows)
-    runs-on: windows-latest
+    name: OPC UA integration suite (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
