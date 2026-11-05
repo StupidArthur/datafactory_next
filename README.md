@@ -64,6 +64,7 @@ export PATH="$(go env GOPATH)/bin:$PATH"
 
 # 核心计算和实时运行时
 cargo build --locked -p df-engine -p df-runtime
+export PATH="$PWD/target/debug:$PATH"  # SDK/集成测试可定位 df-engine
 cargo test --workspace --locked
 
 # Studio 开发模式（显式指向无 .exe 后缀的 Engine）
