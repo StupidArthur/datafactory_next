@@ -3,6 +3,7 @@ name: macOS compatibility
 on:
   push:
     branches:
+      - main
       - "feature/**"
     paths:
       - "main.go"
