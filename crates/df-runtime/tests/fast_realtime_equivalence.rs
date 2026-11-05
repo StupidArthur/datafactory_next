@@ -34,7 +34,8 @@ fn assert_same_model_state(fast: &Snapshot, realtime: &Snapshot) {
         let actual = realtime.values.get(name).expect("missing realtime tag");
         match (expected, actual) {
             (Value::Float(a), Value::Float(b)) => assert!(
-                a.is_finite() && b.is_finite()
+                a.is_finite()
+                    && b.is_finite()
                     && (a - b).abs() <= 1e-10 * (1.0 + a.abs().max(b.abs())),
                 "{name} at cycle {}: {a} vs {b}",
                 fast.cycle_index
@@ -70,11 +71,8 @@ fn two_tank_fast_realtime_equivalence_with_external_writes() {
         );
 
         // Advance the Fast Engine across cycles where Realtime had no input.
-        fast.execute(
-            receipt.effective_cycle_index - before - 1,
-            &BTreeMap::new(),
-        )
-        .expect("fast gap replay");
+        fast.execute(receipt.effective_cycle_index - before - 1, &BTreeMap::new())
+            .expect("fast gap replay");
         let written = fast.execute(1, &values).expect("fast write replay");
         assert_eq!(written.cycle_index, receipt.effective_cycle_index);
         assert!(
@@ -86,11 +84,8 @@ fn two_tank_fast_realtime_equivalence_with_external_writes() {
         // time this snapshot is read. Replay exactly those cycles as well.
         let observed = realtime.snapshot();
         assert!(observed.cycle_index >= written.cycle_index);
-        fast.execute(
-            observed.cycle_index - written.cycle_index,
-            &BTreeMap::new(),
-        )
-        .expect("fast post-write replay");
+        fast.execute(observed.cycle_index - written.cycle_index, &BTreeMap::new())
+            .expect("fast post-write replay");
         assert_same_model_state(&fast.snapshot(), &observed);
     }
 
@@ -108,7 +103,10 @@ fn pid_example_fast_realtime_equivalence_without_external_writes() {
 
     let deadline = Instant::now() + Duration::from_secs(8);
     while realtime.snapshot().cycle_index < 4 {
-        assert!(Instant::now() < deadline, "realtime scheduler made no progress");
+        assert!(
+            Instant::now() < deadline,
+            "realtime scheduler made no progress"
+        );
         thread::sleep(Duration::from_millis(10));
     }
 
