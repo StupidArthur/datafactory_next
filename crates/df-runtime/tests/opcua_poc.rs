@@ -502,6 +502,8 @@ async fn secure_channel_with_username_password_auth() {
             server_certificate: Some(cert_dir.join("server.der")),
             server_private_key: Some(cert_dir.join("server-key.pem")),
             trust_list: Some(trust_dir),
+            // Loopback integration fixture only; production defaults to rejecting untrusted clients.
+            auto_trust_client_certs: true,
             // The engineer is a Writer: the R8 write tests authenticate as
             // this user (§9.1: username/password only over SignAndEncrypt).
             users: vec![OpcUaUserConfig {
