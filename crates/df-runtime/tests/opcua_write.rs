@@ -120,6 +120,8 @@ fn secure_config(port: u16, dir: &Path, wait_override_ms: Option<u64>) -> OpcUaC
             server_certificate: Some(dir.join("cert/server.der")),
             server_private_key: Some(dir.join("cert/server-key.pem")),
             trust_list: Some(dir.join("trusted")),
+            // Loopback integration fixture only; production defaults to rejecting untrusted clients.
+            auto_trust_client_certs: true,
             users: write_users(),
         },
         write_wait_timeout_ms: wait_override_ms,
