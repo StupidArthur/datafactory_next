@@ -34,11 +34,13 @@ fn realtime_multi_instance_soak_csv() {
     let instances = positive_env("DF_SOAK_INSTANCES", 2);
     assert!(instances <= 256, "avoid accidental unbounded process load");
 
-    let project = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/two-tank/project.yaml");
+    let project =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/two-tank/project.yaml");
     let mut runtimes: Vec<Runtime> = (0..instances)
-        .map(|_| Runtime::start(load_engine(&project).expect("load example Engine"))
-            .expect("start realtime instance"))
+        .map(|_| {
+            Runtime::start(load_engine(&project).expect("load example Engine"))
+                .expect("start realtime instance")
+        })
         .collect();
 
     let mut out: Box<dyn Write> = match std::env::var("DF_SOAK_OUTPUT") {
@@ -87,6 +89,9 @@ fn realtime_multi_instance_soak_csv() {
     out.flush().unwrap();
     for runtime in &mut runtimes {
         runtime.stop().expect("graceful stop");
-        assert!(runtime.status().cycle_index > 0, "instance made no progress");
+        assert!(
+            runtime.status().cycle_index > 0,
+            "instance made no progress"
+        );
     }
 }
