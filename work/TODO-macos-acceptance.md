@@ -380,3 +380,33 @@ EOF
 **PASS**：十项全部按独立 OPC UA Client 操作取得真实证据、写入成功/拒绝与预期一致，观察到模型闭环响应，并正常关闭服务。连接或权限受阻时保留失败状态码和日志、确认身份和客户端版本，不能为了“通过”改成明文或取消角色校验。
 
 结束后执行：unset DF_MAC_WRITER_PW DF_MAC_READER_PW。不要提交 DF_MAC_PKI 临时目录、私钥、凭据或完整客户端密钥文件。
+
+
+## 11. 最终报告、回传和验收结束条件
+
+请复制 [REPORT-macos-template.md](REPORT-macos-template.md) 为本次报告：
+
+~~~bash
+cp work/REPORT-macos-template.md "$DF_TEST_OUT/REPORT.md"
+# 打开 REPORT.md 逐项填写，写明未完成的地方和所有失败日志
+git status --short
+~~~
+
+- [ ] 每个 T00～T10 的状态均已填写：PASS / FAIL / BLOCKED / NOT_RUN；禁止空白状态或自行删除失败项。
+- [ ] 对每个 PASS 给出**实测值 + 命令或 GUI 操作 + 证据路径**；不能仅写“OK”。
+- [ ] 如有 FAIL / BLOCKED：写出现象、触发条件、完整报错、最小复现步骤、是否需要修复、复测结果，并把整体结论标注 **INCOMPLETE**。
+- [ ] T07 真实连续运行 >=1800 秒，所需 JSON/CSV/日志齐全，未达到标准不得勾完成。
+- [ ] T09/T10 外部独立客户端的浏览、订阅、加密真实读写、PID 响应、实例隔离和权限拒绝全部有证据。
+- [ ] 核对 .app 从 Finder 启动的测试独立于 wails dev、且不依赖 DF_ENGINE_PATH。
+- [ ] 每次修改源码后记录新 commit 并重测影响范围；报告不得把旧 commit 结果和新 commit 结果合并成一次“全 PASS”。
+- [ ] 提交报告前**逐个审阅文件**，确认不含私钥、明文密码、证书数据库、token、用户隐私；不能直接无检查地 git add -A。
+- [ ] 用一个报告专用分支（建议 test/macos-physical-acceptance-YYYYMMDD）提交非敏感证据、REPORT.md，并发 PR；如不使用分支，请确保没有覆盖或丢失原有代码更改。
+- [ ] 把 PR URL、完整 SHA、测试架构和最终 PASS / INCOMPLETE 状态回传给维护者；保留原始未脱敏证据在本机安全位置，需要时另行安全交换。
+
+**关闭条件（强制）**：仅当 T00～T10 每项必测 PASS、连续 30 分钟长稳 PASS、独立 OPC UA 外部闭环 PASS、Finder .app PASS、证据和 REPORT.md 可复核时，才可以把本 TODO 标记为“验收完成”。
+
+如果遇到真实硬件/第三方客户端/系统权限阻塞，可以结束**当前执行会话**并交付一份状态为 INCOMPLETE 的报告求助；这不等于验收完成。下一轮针对阻塞项修复和重测，直至全 PASS 或维护者正式接受风险并书面记录例外。
+
+---
+
+**执行人提示**：实际测试可能跨多次终端会话；断点记录在 REPORT.md 中，下一次从未通过项继续。不要编造结果，也不要反复运行已知必然失败的步骤来冒充进度。
