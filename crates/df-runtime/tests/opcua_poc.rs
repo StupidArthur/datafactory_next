@@ -586,7 +586,6 @@ async fn secure_channel_with_username_password_auth() {
     server.stop();
 }
 
-
 /// UA-02 / UA-05: use a real independent client to browse the published
 /// hierarchy and read each scalar type, rather than only inspecting the
 /// server-side Tag Catalog.
@@ -667,12 +666,18 @@ async fn client_browses_hierarchy_and_reads_bool_int64_float64_string() {
             .await
             .unwrap(),
     );
-    assert!(instances.contains(&"type-matrix".to_owned()), "{instances:?}");
+    assert!(
+        instances.contains(&"type-matrix".to_owned()),
+        "{instances:?}"
+    );
 
     let folder = index.instances["type-matrix"].tags_folder.clone();
     let names = children(session.browse(&[browse(folder)], 0, None).await.unwrap());
     for expected in ["flag", "counter", "temperature", "message"] {
-        assert!(names.contains(&expected.to_owned()), "{expected} not in {names:?}");
+        assert!(
+            names.contains(&expected.to_owned()),
+            "{expected} not in {names:?}"
+        );
     }
 
     let ids: Vec<NodeId> = ["flag", "counter", "temperature", "message"]
@@ -689,7 +694,6 @@ async fn client_browses_hierarchy_and_reads_bool_int64_float64_string() {
     session.disconnect().await.unwrap();
     server.stop();
 }
-
 
 /// SEC-03: secure clients with unapproved application certificates must not
 /// activate a session. The test client trusts the *server*; the server is
@@ -746,11 +750,9 @@ async fn secure_endpoint_rejects_untrusted_client_certificate() {
             Err(_) => true,
             Ok((session, event_loop)) => {
                 let task = event_loop.spawn();
-                let outcome = tokio::time::timeout(
-                    Duration::from_secs(4),
-                    session.wait_for_connection(),
-                )
-                .await;
+                let outcome =
+                    tokio::time::timeout(Duration::from_secs(4), session.wait_for_connection())
+                        .await;
                 task.abort();
                 !matches!(outcome, Ok(true))
             }
