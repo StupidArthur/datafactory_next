@@ -457,6 +457,11 @@ pub(crate) fn validate_opcua_security(config: &OpcUaConfig) -> Result<(), Runtim
         ));
     }
     let host = endpoint_host(&config.endpoint_url).unwrap_or_default();
+    if config.security.auto_trust_client_certs && !is_loopback_host(&host) {
+        return Err(RuntimeError::Config(
+            "opcua.security.auto_trust_client_certs is restricted to loopback test endpoints".into(),
+        ));
+    }
     if !is_loopback_host(&host) {
         if config.security.mode == SecurityMode::None
             || config.security.policy == SecurityPolicy::None
