@@ -307,3 +307,76 @@ EOF
 - [ ] 保存浏览树、两实例状态、订阅曲线/表格、写入拒绝码的截图和客户端软件版本。
 
 之后在 Runtime Terminal 输入 stop 并记录正常退出。**PASS**：以上都满足，端点正常释放、证据完整。本节不是加密/授权写入验收。
+
+
+## T10 — 独立 OPC UA 客户端：加密、权限、外部 PID 双水箱闭环（必测）
+
+此阶段必须与 T09 分开启动；先 stop T09 的 Runtime，确保 4840 端口空闲。**必须 SignAndEncrypt + Basic256Sha256 + Username/Password，不得降级为 None/Anonymous。** 其中 engineer 为 Writer，viewer 为 Reader。
+
+沿用 T09 的 DF_MAC_PKI 临时目录；如果新开 Terminal，需把 DF_MAC_PKI 设置为 T09 时输出的同一路径。服务器样例证书/私钥必须存在；如缺失，标 BLOCKED 并附 T09 服务端日志，禁止把真实私钥复制进 Git 仓库。
+
+~~~bash
+test -s "$DF_MAC_PKI/own/cert.der"
+test -s "$DF_MAC_PKI/private/private.pem"
+
+# 交互输入，不会将明文口令写入 Shell 历史或 YAML
+export DF_MAC_WRITER_PW="$(python3 -c 'import getpass; print(getpass.getpass("Writer password: "))')"
+export DF_MAC_READER_PW="$(python3 -c 'import getpass; print(getpass.getpass("Reader password: "))')"
+test -n "$DF_MAC_WRITER_PW" && test -n "$DF_MAC_READER_PW"
+
+cat > "$DF_TEST_OUT/T10-secure.yaml" <<EOF
+runtime_version: 1
+opcua:
+  enabled: true
+  endpoint_url: "opc.tcp://127.0.0.1:4840"
+  application_uri: "urn:datafactory:runtime"
+  namespace_uri: "urn:datafactory:runtime:ns"
+  security:
+    mode: SignAndEncrypt
+    policy: Basic256Sha256
+    allow_anonymous: false
+    server_certificate: "$DF_MAC_PKI/own/cert.der"
+    server_private_key: "$DF_MAC_PKI/private/private.pem"
+    trust_list: "$DF_MAC_PKI"
+    users:
+      - username: engineer
+        password_env: DF_MAC_WRITER_PW
+        role: writer
+      - username: viewer
+        password_env: DF_MAC_READER_PW
+        role: reader
+instances:
+  - id: tank-a
+    project: "$PWD/examples/two-tank/pid-closed-loop.yaml"
+    enabled: true
+    scheduler: {overrun_policy: delay, write_queue_capacity: 256}
+  - id: tank-b
+    project: "$PWD/examples/two-tank/pid-closed-loop.yaml"
+    enabled: true
+    scheduler: {overrun_policy: catch_up, write_queue_capacity: 256}
+EOF
+
+./target/debug/df-runtime check --config "$DF_TEST_OUT/T10-secure.yaml" \
+  2>&1 | tee "$DF_TEST_OUT/logs/T10-check.log"
+./target/debug/df-runtime run --config "$DF_TEST_OUT/T10-secure.yaml" \
+  2>&1 | tee "$DF_TEST_OUT/logs/T10-runtime.log"
+~~~
+
+说明：当前 main 的服务器已实现 OPC UA 模式与 Writer/Reader 身份控制，但尚未合入 PR #4 的客户端证书强制信任改动。本节证明配置的加密通道及业务写入，不等于全面安全渗透测试。信任客户端证书的负向验收留待修订后专项进行。
+
+在独立客户端中，信任刚生成的**本机测试服务端证书**，选择 SignAndEncrypt / Basic256Sha256、用户名 engineer；配置时不要开启全局“信任任何服务器”用于非本机环境。逐项执行，每步记录 **墙钟时间 + 完整节点路径 + 读数 + 返回 StatusCode**：
+
+1. [ ] **加密连接**：以 engineer 成功建立安全 Session，核对 SecurityPolicy 与 MessageSecurityMode 没有被降级，记录不含密码的连接设置截图。
+2. [ ] **基线**：读取 tank-a 和 tank-b 的 level_setpoint，约为 0.09706422；读取 tank-a 的 pid2.SV、pid2.PV、pid2.MV（初值约 23）、valve_1.target_opening、valve_1.current_opening、valve_1.outlet_flow、tank_1.level（初值约 0.0621211）、tank_2.level（初值约 0.09706422）。启动后允许少量连续模型变化，但不能为 NaN/Infinity。
+3. [ ] **上调阶跃**：向 tank-a 的 level_setpoint **以 FLOAT64 类型**写入 0.40，客户端写响应为 Good；随后 pid2.SV≈0.40。继续订阅/记录至少 **60 秒**，PID MV、阀门目标及实际开度相对基线增加，tank_1.level / tank_2.level 出现与改变流量一致的动态响应。至少记录写前、写后中间点、60 秒末三组数值及写入时间。
+4. [ ] **实例隔离**：上一步全过程 tank-b/level_setpoint 仍保持写前值，tank-b 的 CycleIndex 持续增加；tank-a 写入不得修改 tank-b 的变量或导致其停止。
+5. [ ] **下调阶跃**：以 FLOAT64 将 tank-a/level_setpoint 写成 0.20，响应 Good；观察至少 **60 秒**。随后 PID MV、阀门目标/实际开度以及阀门流量相对上调阶段下降。阀门全行程约 12s，水箱存在过程滞后，因此不要求同一个周期水箱液位立刻反向。
+6. [ ] **只读拒绝**：以 engineer 向 tank-a 的 tank_2.level 或 pid2.MV 写值；应返回 BadNotWritable（若客户端显示其他 Bad*，须记录并解释）；被拒绝的值不能直接覆写模型快照，模型继续按周期运行。
+7. [ ] **Viewer 拒绝**：以 viewer 建立加密 Session，Reader 可正常 Read/Subscribe；尝试写 tank-a 的 level_setpoint 应返回 BadUserAccessDenied，并且原值不变。
+8. [ ] **错误节点/错误类型**：以 engineer 向不存在的 NodeId 写入，应返回 BadNodeIdUnknown；向 FLOAT64 Tag 发送 STRING，应返回 BadTypeMismatch。若客户端不允许发出错误类型请求，改用支持原始 WriteRequest 的另一客户端；当前项记 BLOCKED，不能误写 PASS。
+9. [ ] **停止与重启**：Runtime Terminal 输入 stop，服务器释放端口、客户端断开；以相同配置重启，原有 NodeId 字符串标识符稳定，两个实例恢复 Running 且可读取，然后再次 stop。
+10. [ ] **证据**：提供客户端连接设置、浏览树、身份与拒绝码、时间序列曲线、上下阶跃表，及服务端日志。至少记录 SV、PID MV、阀门实际开度、两水箱液位、tank-b SV、两实例 CycleIndex。
+
+**PASS**：十项全部按独立 OPC UA Client 操作取得真实证据、写入成功/拒绝与预期一致，观察到模型闭环响应，并正常关闭服务。连接或权限受阻时保留失败状态码和日志、确认身份和客户端版本，不能为了“通过”改成明文或取消角色校验。
+
+结束后执行：unset DF_MAC_WRITER_PW DF_MAC_READER_PW。不要提交 DF_MAC_PKI 临时目录、私钥、凭据或完整客户端密钥文件。
