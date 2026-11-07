@@ -120,6 +120,8 @@ fn secure_config(port: u16, dir: &Path, wait_override_ms: Option<u64>) -> OpcUaC
             server_certificate: Some(dir.join("cert/server.der")),
             server_private_key: Some(dir.join("cert/server-key.pem")),
             trust_list: Some(dir.join("trusted")),
+            // Loopback integration fixture only; production defaults to rejecting untrusted clients.
+            auto_trust_client_certs: true,
             users: write_users(),
         },
         write_wait_timeout_ms: wait_override_ms,
@@ -283,6 +285,13 @@ fn start_dual_fixture(name: &str, project: &Path, queue_capacity: usize) -> Dual
 
     let engine_a = load_engine(project).unwrap();
     let engine_b = load_engine(project).unwrap();
+    // Compare the deterministic initial model states *before* independent
+    // realtime schedulers can advance at different wall-clock instants.
+    assert_eq!(
+        engine_a.snapshot(),
+        engine_b.snapshot(),
+        "both instances must load the same initial model state"
+    );
     let catalogs = vec![
         InstanceCatalog {
             instance_id: INSTANCE.into(),
@@ -798,13 +807,18 @@ async fn two_tank_closed_loop_is_isolated_between_two_instances() {
     let inlet_b = fixture.tag(SECOND_INSTANCE, INLET);
     let level_b = fixture.tag(SECOND_INSTANCE, LEVEL);
 
-    // Both instances start from the same project state.
+    // Both instances start from the same model state (checked in the fixture).
+    // Client reads are intentionally not simultaneous: the two independent
+    // schedulers can already be on different cycles when these reads arrive.
     let initial_b = read_values(&session_b, &[inlet_b.clone(), level_b.clone()]).await;
     assert_eq!(initial_b[0].status, Some(opcua::types::StatusCode::Good));
     assert!((as_double(&initial_b[0]) - INITIAL_INLET).abs() < 1e-9);
     let initial_level_b = as_double(&initial_b[1]);
     let initial_level_a = as_double(&read_values(&session_a, &[level_a.clone()]).await[0]);
-    assert!((initial_level_a - initial_level_b).abs() < 1e-9);
+    assert!(
+        initial_level_a.is_finite() && initial_level_b.is_finite(),
+        "both independently sampled tank levels must be finite"
+    );
 
     // CL-01: the setpoint enters the engine and the write is confirmed only
     // after the cycle-boundary acknowledgement.

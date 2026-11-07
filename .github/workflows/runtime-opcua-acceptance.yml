@@ -1,0 +1,41 @@
+name: OPC UA full integration acceptance
+
+on:
+  push:
+    branches:
+      - main
+      - "feature/**"
+      - "test/**"
+    paths:
+      - "crates/df-runtime/**"
+      - "crates/df-core/**"
+      - "examples/two-tank/**"
+      - ".github/workflows/runtime-opcua-acceptance.yml"
+  pull_request:
+    paths:
+      - "crates/df-runtime/**"
+      - "crates/df-core/**"
+      - "examples/two-tank/**"
+      - ".github/workflows/runtime-opcua-acceptance.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  opcua:
+    name: OPC UA integration suite (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Verify source formatting
+        run: cargo fmt --all -- --check
+      - name: Run all Runtime integration tests with OPC UA enabled
+        run: cargo test --locked -p df-runtime --features opcua --tests -- --nocapture

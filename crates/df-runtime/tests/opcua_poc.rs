@@ -502,6 +502,8 @@ async fn secure_channel_with_username_password_auth() {
             server_certificate: Some(cert_dir.join("server.der")),
             server_private_key: Some(cert_dir.join("server-key.pem")),
             trust_list: Some(trust_dir),
+            // Loopback integration fixture only; production defaults to rejecting untrusted clients.
+            auto_trust_client_certs: true,
             // The engineer is a Writer: the R8 write tests authenticate as
             // this user (§9.1: username/password only over SignAndEncrypt).
             users: vec![OpcUaUserConfig {
@@ -581,5 +583,187 @@ async fn secure_channel_with_username_password_auth() {
         "a wrong password must not yield a connected session"
     );
 
+    server.stop();
+}
+
+/// UA-02 / UA-05: use a real independent client to browse the published
+/// hierarchy and read each scalar type, rather than only inspecting the
+/// server-side Tag Catalog.
+#[tokio::test]
+async fn client_browses_hierarchy_and_reads_bool_int64_float64_string() {
+    use opcua::types::{BrowseDescription, BrowseDirection};
+
+    let port = free_port();
+    let config = loopback_none_config(port);
+    let tags = [
+        ("flag", "BOOL", Value::Bool(true)),
+        ("counter", "INT64", Value::Int(-41)),
+        ("temperature", "FLOAT64", Value::Float(37.25)),
+        ("message", "STRING", Value::String("ready".into())),
+    ]
+    .into_iter()
+    .map(|(name, data_type, initial)| TagDescriptor {
+        name: name.into(),
+        data_type: data_type.into(),
+        writable: false,
+        unit: String::new(),
+        description: String::new(),
+        initial,
+    })
+    .collect();
+    let catalogs = vec![InstanceCatalog {
+        instance_id: "type-matrix".into(),
+        tags,
+    }];
+    let mut server = OpcUaServer::start_with_catalogs(&config, &catalogs).unwrap();
+    let session = connect_anonymous("ua02_ua05", &config.endpoint_url).await;
+    assert!(session.wait_for_connection().await);
+
+    // HierarchicalReferences (i=33), including Organizes and HasComponent.
+    let browse = |node_id: NodeId| BrowseDescription {
+        node_id,
+        browse_direction: BrowseDirection::Forward,
+        reference_type_id: NodeId::new(0, 33u32),
+        include_subtypes: true,
+        node_class_mask: 0,
+        result_mask: 63,
+    };
+    let children = |results: Vec<opcua::types::BrowseResult>| -> Vec<String> {
+        assert_eq!(results.len(), 1);
+        assert!(results[0].status_code.is_good(), "browse status");
+        results[0]
+            .references
+            .as_ref()
+            .expect("browse references")
+            .iter()
+            .map(|reference| reference.browse_name.name.as_ref().to_string())
+            .collect()
+    };
+    let objects = children(
+        session
+            .browse(&[browse(NodeId::objects_folder_id())], 0, None)
+            .await
+            .unwrap(),
+    );
+    assert!(objects.contains(&"DataFactory".to_owned()), "{objects:?}");
+
+    let index = server.address_space().clone();
+    let root = index.root.clone().expect("DataFactory folder");
+    let top = children(session.browse(&[browse(root)], 0, None).await.unwrap());
+    assert!(top.contains(&"ServerStatus".to_owned()), "{top:?}");
+    assert!(top.contains(&"Instances".to_owned()), "{top:?}");
+
+    let instances = children(
+        session
+            .browse(
+                &[browse(NodeId::new(
+                    server.namespace_index(),
+                    "df/instances",
+                ))],
+                0,
+                None,
+            )
+            .await
+            .unwrap(),
+    );
+    assert!(
+        instances.contains(&"type-matrix".to_owned()),
+        "{instances:?}"
+    );
+
+    let folder = index.instances["type-matrix"].tags_folder.clone();
+    let names = children(session.browse(&[browse(folder)], 0, None).await.unwrap());
+    for expected in ["flag", "counter", "temperature", "message"] {
+        assert!(
+            names.contains(&expected.to_owned()),
+            "{expected} not in {names:?}"
+        );
+    }
+
+    let ids: Vec<NodeId> = ["flag", "counter", "temperature", "message"]
+        .iter()
+        .map(|name| index.tag("type-matrix", name).unwrap().node_id.clone())
+        .collect();
+    let data = read_values(&session, &ids).await;
+    assert_eq!(data.len(), 4);
+    assert!(matches!(data[0].value, Some(Variant::Boolean(true))));
+    assert!(matches!(data[1].value, Some(Variant::Int64(-41))));
+    assert!(matches!(data[2].value, Some(Variant::Double(value)) if (value - 37.25).abs() < 1e-12));
+    assert_eq!(as_string(&data[3]), "ready");
+
+    session.disconnect().await.unwrap();
+    server.stop();
+}
+
+/// SEC-03: secure clients with unapproved application certificates must not
+/// activate a session. The test client trusts the *server*; the server is
+/// deliberately configured not to trust the test client's certificate.
+#[tokio::test]
+async fn secure_endpoint_rejects_untrusted_client_certificate() {
+    let dir = scratch_dir("sec03_reject");
+    let cert_dir = dir.join("cert");
+    let trust_dir = dir.join("pki");
+    std::fs::create_dir_all(&cert_dir).unwrap();
+    std::fs::create_dir_all(&trust_dir).unwrap();
+    let port = free_port();
+    let config = df_runtime::OpcUaConfig {
+        enabled: true,
+        endpoint_url: format!("opc.tcp://127.0.0.1:{port}"),
+        application_uri: "urn:datafactory:runtime".into(),
+        namespace_uri: "urn:datafactory:runtime:ns".into(),
+        security: df_runtime::OpcUaSecurityConfig {
+            mode: df_runtime::SecurityMode::SignAndEncrypt,
+            policy: df_runtime::SecurityPolicy::Basic256Sha256,
+            allow_anonymous: true,
+            server_certificate: Some(cert_dir.join("server.der")),
+            server_private_key: Some(cert_dir.join("server-key.pem")),
+            trust_list: Some(trust_dir),
+            auto_trust_client_certs: false,
+            users: vec![],
+        },
+        write_wait_timeout_ms: None,
+    };
+    let mut server = OpcUaServer::start_with_catalogs(&config, &[]).unwrap();
+
+    let mut client = ClientBuilder::new()
+        .application_name("Untrusted DataFactory Client")
+        .application_uri("urn:datafactory:untrusted-client")
+        .pki_dir(scratch_dir("sec03_client").join("client_pki"))
+        .create_sample_keypair(true)
+        .trust_server_certs(true)
+        .session_retry_limit(0)
+        .request_timeout(Duration::from_secs(3))
+        .client()
+        .unwrap();
+
+    let endpoint = (
+        config.endpoint_url.as_str(),
+        UaSecurityPolicy::Basic256Sha256.to_str(),
+        MessageSecurityMode::SignAndEncrypt,
+        opcua::types::UserTokenPolicy::anonymous(),
+    );
+    let rejected = tokio::time::timeout(Duration::from_secs(12), async {
+        match client
+            .connect_to_matching_endpoint(endpoint, IdentityToken::Anonymous)
+            .await
+        {
+            Err(_) => true,
+            Ok((session, event_loop)) => {
+                let task = event_loop.spawn();
+                let outcome =
+                    tokio::time::timeout(Duration::from_secs(4), session.wait_for_connection())
+                        .await;
+                task.abort();
+                !matches!(outcome, Ok(true))
+            }
+        }
+    })
+    .await
+    .expect("untrusted client connection must terminate or time out deterministically");
+
+    assert!(
+        rejected,
+        "untrusted client certificate must not activate an encrypted OPC UA session"
+    );
     server.stop();
 }
